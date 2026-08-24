@@ -1,19 +1,9 @@
-ACTUALIZAR RESPALDO ERP A V3.1 CRM
+V3.2 CRM REAL
 
-1. Descomprimí este ZIP.
-2. Entrá al repositorio GitHub `respaldo-erp`.
-3. Reemplazá:
-   - app.py
-   - requirements.txt
-   - .streamlit/config.toml
+1. Abrí GitHub > respaldo-erp.
+2. Add file > Upload files.
+3. Subí el app.py de esta carpeta y reemplazá el anterior.
 4. Commit changes.
-5. Esperá que Streamlit haga el redeploy.
-6. Entrá a la app.
-7. Abrí `Importar Excel`.
-8. Cargá ESTADISTICAS.xlsx.
-9. Después probá:
-   - CRM
-   - Clientes
-   - Dashboard
-
-No hace falta crear otra aplicación ni otra URL.
+5. Esperá el redeploy de Streamlit.
+6. En la app: Importar Excel > cargá ESTADISTICAS.xlsx.
+7. Revisá Clientes y CRM.

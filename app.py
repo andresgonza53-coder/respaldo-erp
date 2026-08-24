@@ -15,7 +15,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.1 - CRM"
+APP_VERSION = "3.2 - CRM Real"
 
 
 # ============================================================
@@ -328,7 +328,7 @@ def read_crm_excel(uploaded_file):
 
     for normalized, original in sheet_map.items():
         try:
-            df = pd.read_excel(xls, sheet_name=original)
+            df = pd.read_excel(xls, sheet_name=original, header=1 if "CLIENT" in normalized else 0)
         except Exception:
             continue
         df = df.dropna(how="all")
@@ -355,12 +355,15 @@ def read_crm_excel(uploaded_file):
             ]
         )
 
-        # Detecta las columnas de las etapas comerciales actuales.
+        # Columnas reales del Excel: A, V, R, P, C.
+        stage_alias = {
+            "Acercamiento": "A", "Visita": "V", "Relevamiento": "R",
+            "Presupuesto": "P", "Cierre": "C"
+        }
         stage_cols = {}
-        for stage in CRM_STAGES:
-            target = norm_col(stage)
+        for stage, alias in stage_alias.items():
             for col in clients.columns:
-                if target in norm_col(col):
+                if norm_col(col) == alias:
                     stage_cols[stage] = col
                     break
 
@@ -410,20 +413,12 @@ def is_positive_excel_mark(value):
     return text in {"SI", "S", "YES", "TRUE", "X", "OK", "1", "HECHO", "REALIZADO"} or "SI" == text
 
 def enrich_contacts(clients_df, contacts_df):
-    """Devuelve una tabla de clientes unificada de forma conservadora."""
+    """Une CLIENTES con CONTACTOS usando el nombre de empresa."""
     if clients_df.empty:
-        return pd.DataFrame(columns=[
-            "Cliente", "Contacto", "Teléfono", "Correo", "Ciudad", "Estado"
-        ])
+        return pd.DataFrame(columns=["Cliente", "Ciudad", "Contacto", "Área", "Teléfono", "Correo", "Estado"])
 
-    client_col = first_matching_column(
-        clients_df,
-        [["CLIENTE"], ["EMPRESA"], ["RAZON", "SOCIAL"], ["NOMBRE"]]
-    )
-    phone_col = first_matching_column(clients_df, [["TELEF"], ["CELULAR"]])
-    email_col = first_matching_column(clients_df, [["CORREO"], ["EMAIL"], ["E MAIL"]])
+    client_col = first_matching_column(clients_df, [["CLIENTE"], ["EMPRESA"], ["RAZON", "SOCIAL"], ["NOMBRE"]])
     city_col = first_matching_column(clients_df, [["CIUDAD"], ["LOCALIDAD"]])
-    contact_col = first_matching_column(clients_df, [["CONTACTO"]])
 
     rows = []
     for _, r in clients_df.iterrows():
@@ -432,14 +427,34 @@ def enrich_contacts(clients_df, contacts_df):
             continue
         rows.append({
             "Cliente": name,
-            "Contacto": clean_excel_value(r.get(contact_col, "")) if contact_col else "",
-            "Teléfono": clean_excel_value(r.get(phone_col, "")) if phone_col else "",
-            "Correo": clean_excel_value(r.get(email_col, "")) if email_col else "",
             "Ciudad": clean_excel_value(r.get(city_col, "")) if city_col else "",
-            "Estado": "Activo",
+            "Contacto": "", "Área": "", "Teléfono": "", "Correo": "", "Estado": "Activo",
         })
-
     out = pd.DataFrame(rows).drop_duplicates(subset=["Cliente"], keep="first")
+
+    if not contacts_df.empty:
+        cc = first_matching_column(contacts_df, [["CLIENTES"], ["CLIENTE"], ["EMPRESA"]])
+        ac = first_matching_column(contacts_df, [["AREA"]])
+        nc = first_matching_column(contacts_df, [["CONTACTO"]])
+        pc = first_matching_column(contacts_df, [["CELULAR"], ["TELEF"]])
+        ec = first_matching_column(contacts_df, [["CORREO"], ["EMAIL"]])
+        grouped = {}
+        for _, r in contacts_df.iterrows():
+            company = clean_excel_value(r.get(cc, "")) if cc else ""
+            if not company: continue
+            key = norm_col(company)
+            grouped.setdefault(key, {"contact": [], "area": [], "phone": [], "email": []})
+            vals = grouped[key]
+            for k, col in [("contact", nc), ("area", ac), ("phone", pc), ("email", ec)]:
+                v = clean_excel_value(r.get(col, "")) if col else ""
+                if v and v not in vals[k]: vals[k].append(v)
+        for i, r in out.iterrows():
+            vals = grouped.get(norm_col(r["Cliente"]))
+            if vals:
+                out.at[i,"Contacto"] = " | ".join(vals["contact"])
+                out.at[i,"Área"] = " | ".join(vals["area"])
+                out.at[i,"Teléfono"] = " | ".join(vals["phone"])
+                out.at[i,"Correo"] = " | ".join(vals["email"])
     return out.reset_index(drop=True)
 
 def crm_kpis(df):
@@ -1109,6 +1124,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.1 CRM</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.2 CRM Real</div>',
     unsafe_allow_html=True,
 )
