@@ -1,30 +1,30 @@
-# Respaldo Industrial ERP — V3 Dashboard
+# Respaldo Industrial ERP — V3.1 CRM
 
-Primer prototipo funcional del ERP web.
+Esta actualización desarrolla el primer módulo real del ERP: **Clientes + CRM**.
 
-## Incluye
-- Dashboard.
-- Menú completo del futuro ERP.
-- CRM editable.
-- Productos y stock.
-- Presupuestos básicos.
-- Apertura/movimientos/cierre de caja.
-- Importación y previsualización de ESTADISTICAS.xlsx.
-- Importación y previsualización de FLUJO RI SRL.xlsx.
-- Estructura preparada para integrar Compras/OCR.
+## Lo nuevo
+- importación de `ESTADISTICAS.xlsx`;
+- reconocimiento de las hojas CLIENTES, CONTACTOS y MEDICIONES;
+- transformación inicial a una base de clientes;
+- pipeline CRM basado en las etapas:
+  Acercamiento → Visita → Relevamiento → Presupuesto → Cierre → Seguimiento;
+- filtros por cliente, etapa, responsable y estado;
+- próxima acción y fecha;
+- seguimientos vencidos;
+- ficha de cliente;
+- nueva gestión comercial;
+- KPIs CRM en pantalla;
+- integración con el Dashboard.
 
 ## Importante
-Esta versión usa `st.session_state`: los datos creados dentro de la app son temporales y pueden perderse cuando Streamlit reinicia la aplicación.
+La estructura actual del Excel se toma como punto de partida, pero esta V3.1 todavía guarda los cambios de la app en memoria de Streamlit.
 
-La siguiente etapa debe incorporar una base de datos persistente, por ejemplo PostgreSQL/Supabase.
+La siguiente versión debe incorporar una base de datos PostgreSQL/Supabase para persistencia.
 
-## Actualizar tu aplicación actual
-Recomendación: crear una NUEVA app/repo para el ERP V3 y dejar Presupuestos OCR funcionando aparte mientras probamos.
+## Actualización
+Reemplazá en el repositorio `respaldo-erp`:
+- `app.py`
+- `requirements.txt`
+- `.streamlit/config.toml`
 
-1. Crear un repositorio nuevo, por ejemplo `respaldo-erp`.
-2. Subir `app.py`, `requirements.txt` y la carpeta `.streamlit`.
-3. En Streamlit Community Cloud crear una nueva app.
-4. Seleccionar `app.py`.
-5. Desplegar.
-
-No subas ESTADISTICAS.xlsx ni FLUJO RI SRL.xlsx al repositorio público. La propia aplicación permite cargarlos desde la pantalla "Importar Excel".
+Hacé Commit changes. Streamlit reconstruirá la misma app.

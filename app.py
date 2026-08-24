@@ -1,5 +1,6 @@
 
 import io
+import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -14,7 +15,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.0 - Prototipo"
+APP_VERSION = "3.1 - CRM"
 
 
 # ============================================================
@@ -161,6 +162,9 @@ def init_state():
         ],
         "imported_stats": None,
         "imported_flow": None,
+        "crm_import": None,
+        "crm_clients": [],
+        "crm_activities": [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -280,6 +284,189 @@ def discover_flow_metrics(uploaded_file):
 
     return result
 
+
+
+# ============================================================
+# CRM V3.1 - IMPORTACIÓN, FILTROS Y MÉTRICAS
+# ============================================================
+CRM_STAGES = ["Acercamiento", "Visita", "Relevamiento", "Presupuesto", "Cierre", "Seguimiento"]
+
+def norm_col(value):
+    text = str(value or "").strip().upper()
+    replacements = {
+        "Á":"A", "É":"E", "Í":"I", "Ó":"O", "Ú":"U", "Ñ":"N"
+    }
+    for a, b in replacements.items():
+        text = text.replace(a, b)
+    text = re.sub(r"[^A-Z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def first_matching_column(df, tokens):
+    normalized = {col: norm_col(col) for col in df.columns}
+    for token_group in tokens:
+        for col, name in normalized.items():
+            if all(tok in name for tok in token_group):
+                return col
+    return None
+
+def read_crm_excel(uploaded_file):
+    """
+    Importador flexible para ESTADISTICAS.xlsx.
+    Mantiene la lógica actual aunque los encabezados cambien ligeramente.
+    """
+    xls = pd.ExcelFile(io.BytesIO(uploaded_file.getvalue()))
+    result = {
+        "sheets": xls.sheet_names,
+        "clients": pd.DataFrame(),
+        "contacts": pd.DataFrame(),
+        "measurements": pd.DataFrame(),
+        "activities": pd.DataFrame(),
+    }
+
+    # Hojas observadas en el archivo actual: CLIENTES, CONTACTOS, MEDICIONES, DUDAS.
+    sheet_map = {norm_col(s): s for s in xls.sheet_names}
+
+    for normalized, original in sheet_map.items():
+        try:
+            df = pd.read_excel(xls, sheet_name=original)
+        except Exception:
+            continue
+        df = df.dropna(how="all")
+
+        if "CLIENT" in normalized:
+            result["clients"] = df
+        elif "CONTACT" in normalized:
+            result["contacts"] = df
+        elif "MEDIC" in normalized:
+            result["measurements"] = df
+
+    # Construcción de actividades desde CLIENTES:
+    clients = result["clients"]
+    activities = []
+
+    if not clients.empty:
+        client_col = first_matching_column(
+            clients,
+            [
+                ["CLIENTE"],
+                ["EMPRESA"],
+                ["RAZON", "SOCIAL"],
+                ["NOMBRE"],
+            ]
+        )
+
+        # Detecta las columnas de las etapas comerciales actuales.
+        stage_cols = {}
+        for stage in CRM_STAGES:
+            target = norm_col(stage)
+            for col in clients.columns:
+                if target in norm_col(col):
+                    stage_cols[stage] = col
+                    break
+
+        for idx, row in clients.iterrows():
+            client_name = ""
+            if client_col is not None:
+                client_name = clean_excel_value(row.get(client_col, ""))
+            if not client_name:
+                # Evita crear actividades fantasma.
+                continue
+
+            detected_stages = []
+            for stage, col in stage_cols.items():
+                value = row.get(col, "")
+                if is_positive_excel_mark(value):
+                    detected_stages.append(stage)
+
+            current_stage = detected_stages[-1] if detected_stages else "Acercamiento"
+
+            activities.append({
+                "Cliente": client_name,
+                "Etapa": current_stage,
+                "Última gestión": "",
+                "Próxima acción": "",
+                "Fecha próxima": pd.NaT,
+                "Responsable": "",
+                "Estado": "Activo",
+                "Origen": "ESTADISTICAS.xlsx",
+            })
+
+    result["activities"] = pd.DataFrame(activities)
+    return result
+
+def clean_excel_value(value):
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+def is_positive_excel_mark(value):
+    if pd.isna(value):
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = norm_col(value)
+    return text in {"SI", "S", "YES", "TRUE", "X", "OK", "1", "HECHO", "REALIZADO"} or "SI" == text
+
+def enrich_contacts(clients_df, contacts_df):
+    """Devuelve una tabla de clientes unificada de forma conservadora."""
+    if clients_df.empty:
+        return pd.DataFrame(columns=[
+            "Cliente", "Contacto", "Teléfono", "Correo", "Ciudad", "Estado"
+        ])
+
+    client_col = first_matching_column(
+        clients_df,
+        [["CLIENTE"], ["EMPRESA"], ["RAZON", "SOCIAL"], ["NOMBRE"]]
+    )
+    phone_col = first_matching_column(clients_df, [["TELEF"], ["CELULAR"]])
+    email_col = first_matching_column(clients_df, [["CORREO"], ["EMAIL"], ["E MAIL"]])
+    city_col = first_matching_column(clients_df, [["CIUDAD"], ["LOCALIDAD"]])
+    contact_col = first_matching_column(clients_df, [["CONTACTO"]])
+
+    rows = []
+    for _, r in clients_df.iterrows():
+        name = clean_excel_value(r.get(client_col, "")) if client_col else ""
+        if not name:
+            continue
+        rows.append({
+            "Cliente": name,
+            "Contacto": clean_excel_value(r.get(contact_col, "")) if contact_col else "",
+            "Teléfono": clean_excel_value(r.get(phone_col, "")) if phone_col else "",
+            "Correo": clean_excel_value(r.get(email_col, "")) if email_col else "",
+            "Ciudad": clean_excel_value(r.get(city_col, "")) if city_col else "",
+            "Estado": "Activo",
+        })
+
+    out = pd.DataFrame(rows).drop_duplicates(subset=["Cliente"], keep="first")
+    return out.reset_index(drop=True)
+
+def crm_kpis(df):
+    if df is None or df.empty:
+        return {
+            "total": 0, "pending": 0, "overdue": 0,
+            "quotes": 0, "closed": 0
+        }
+
+    today = pd.Timestamp(date.today())
+    dates = pd.to_datetime(df.get("Fecha próxima"), errors="coerce")
+    active = df.get("Estado", pd.Series(["Activo"] * len(df))).astype(str).str.upper().eq("ACTIVO")
+    pending = dates.notna() & active
+    overdue = pending & (dates < today)
+
+    return {
+        "total": int(len(df)),
+        "pending": int(pending.sum()),
+        "overdue": int(overdue.sum()),
+        "quotes": int(df.get("Etapa", pd.Series()).astype(str).eq("Presupuesto").sum()),
+        "closed": int(df.get("Etapa", pd.Series()).astype(str).eq("Cierre").sum()),
+    }
+
+def create_timeline(client_name, crm_df):
+    if crm_df is None or crm_df.empty:
+        return pd.DataFrame()
+    return crm_df[crm_df["Cliente"].astype(str) == str(client_name)].copy()
 
 # ============================================================
 # SIDEBAR
@@ -408,64 +595,244 @@ if page == "🏠 Inicio":
 elif page == "🤝 CRM":
     page_header("CRM", "Seguimiento comercial desde acercamiento hasta cierre")
 
-    c1, c2 = st.columns([1.7, 1])
-    with c1:
+    # Fuente principal: importación del Excel, si existe.
+    if st.session_state.crm_activities:
+        crm_df = pd.DataFrame(st.session_state.crm_activities)
+    else:
         crm_df = pd.DataFrame(st.session_state.crm)
+
+        if not crm_df.empty:
+            crm_df = crm_df.rename(columns={"Fecha": "Fecha próxima"})
+            if "Última gestión" not in crm_df:
+                crm_df["Última gestión"] = ""
+            if "Estado" not in crm_df:
+                crm_df["Estado"] = "Activo"
+            if "Origen" not in crm_df:
+                crm_df["Origen"] = "Demo"
+
+    for col in ["Cliente", "Etapa", "Última gestión", "Próxima acción",
+                "Fecha próxima", "Responsable", "Estado", "Origen"]:
+        if col not in crm_df.columns:
+            crm_df[col] = ""
+
+    crm_df["Fecha próxima"] = pd.to_datetime(crm_df["Fecha próxima"], errors="coerce")
+    metrics = crm_kpis(crm_df)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        kpi("Clientes / oportunidades", metrics["total"])
+    with c2:
+        kpi("Pendientes con fecha", metrics["pending"])
+    with c3:
+        kpi("Seguimientos vencidos", metrics["overdue"])
+    with c4:
+        kpi("En presupuesto", metrics["quotes"])
+    with c5:
+        kpi("En cierre", metrics["closed"])
+
+    st.write("")
+
+    # Filtros
+    f1, f2, f3, f4 = st.columns([1.4, 1, 1, 1])
+    search = f1.text_input("Buscar cliente", placeholder="Empresa, cliente...")
+    stage_filter = f2.multiselect("Etapa", CRM_STAGES, default=[])
+    owner_values = sorted([x for x in crm_df["Responsable"].dropna().astype(str).unique() if x.strip()])
+    owner_filter = f3.multiselect("Responsable", owner_values, default=[])
+    status_filter = f4.multiselect("Estado", ["Activo", "Pausado", "Ganado", "Perdido"], default=[])
+
+    filtered = crm_df.copy()
+    if search:
+        filtered = filtered[
+            filtered["Cliente"].astype(str).str.contains(search, case=False, na=False)
+        ]
+    if stage_filter:
+        filtered = filtered[filtered["Etapa"].isin(stage_filter)]
+    if owner_filter:
+        filtered = filtered[filtered["Responsable"].isin(owner_filter)]
+    if status_filter:
+        filtered = filtered[filtered["Estado"].isin(status_filter)]
+
+    tab_pipeline, tab_actions, tab_client, tab_new = st.tabs([
+        "📌 Pipeline", "📅 Próximas acciones", "🏢 Ficha del cliente", "➕ Nueva gestión"
+    ])
+
+    with tab_pipeline:
+        st.markdown("#### Oportunidades")
         edited = st.data_editor(
-            crm_df,
+            filtered[
+                ["Cliente", "Etapa", "Última gestión", "Próxima acción",
+                 "Fecha próxima", "Responsable", "Estado", "Origen"]
+            ],
             hide_index=True,
             use_container_width=True,
             num_rows="dynamic",
             column_config={
-                "Etapa": st.column_config.SelectboxColumn(
-                    "Etapa",
-                    options=["Acercamiento", "Visita", "Relevamiento", "Presupuesto", "Cierre", "Seguimiento"],
+                "Etapa": st.column_config.SelectboxColumn("Etapa", options=CRM_STAGES),
+                "Fecha próxima": st.column_config.DateColumn("Fecha próxima", format="DD/MM/YYYY"),
+                "Estado": st.column_config.SelectboxColumn(
+                    "Estado", options=["Activo", "Pausado", "Ganado", "Perdido"]
                 ),
-                "Fecha": st.column_config.DateColumn("Fecha", format="DD/MM/YYYY"),
             },
+            key="crm_pipeline_editor",
         )
-        st.session_state.crm = edited.to_dict("records")
 
-    with c2:
-        st.markdown("### Nueva actividad")
-        cliente = st.text_input("Cliente")
-        etapa = st.selectbox("Etapa", ["Acercamiento", "Visita", "Relevamiento", "Presupuesto", "Cierre", "Seguimiento"])
-        accion = st.text_input("Próxima acción")
-        fecha = st.date_input("Fecha", date.today())
-        responsable = st.text_input("Responsable", "Andrés")
-        if st.button("Agregar actividad", type="primary", use_container_width=True):
-            if cliente and accion:
-                st.session_state.crm.append({
-                    "Cliente": cliente,
-                    "Etapa": etapa,
-                    "Próxima acción": accion,
-                    "Fecha": fecha,
-                    "Responsable": responsable,
-                })
-                st.success("Actividad agregada.")
-                st.rerun()
+        if st.button("💾 Guardar cambios del CRM", type="primary"):
+            if st.session_state.crm_activities:
+                # Actualiza por Cliente en esta primera versión.
+                original = pd.DataFrame(st.session_state.crm_activities)
+                for _, row in edited.iterrows():
+                    mask = original["Cliente"].astype(str).eq(str(row["Cliente"]))
+                    if mask.any():
+                        for col in edited.columns:
+                            original.loc[mask, col] = row[col]
+                    else:
+                        original = pd.concat([original, pd.DataFrame([row])], ignore_index=True)
+                st.session_state.crm_activities = original.to_dict("records")
             else:
+                st.session_state.crm_activities = edited.to_dict("records")
+            st.success("Cambios guardados temporalmente.")
+            st.rerun()
+
+        st.caption(
+            "En la próxima etapa estos cambios quedarán guardados permanentemente en una base de datos."
+        )
+
+    with tab_actions:
+        actions = crm_df.copy()
+        actions["Fecha próxima"] = pd.to_datetime(actions["Fecha próxima"], errors="coerce")
+        actions = actions[actions["Fecha próxima"].notna()].sort_values("Fecha próxima")
+
+        if actions.empty:
+            st.info("No hay acciones con fecha asignada.")
+        else:
+            today_ts = pd.Timestamp(date.today())
+            actions["Situación"] = actions["Fecha próxima"].apply(
+                lambda x: "VENCIDA" if x < today_ts else ("HOY" if x == today_ts else "PRÓXIMA")
+            )
+            st.dataframe(
+                actions[
+                    ["Situación", "Fecha próxima", "Cliente", "Etapa",
+                     "Próxima acción", "Responsable", "Estado"]
+                ],
+                hide_index=True,
+                use_container_width=True,
+            )
+
+    with tab_client:
+        client_options = sorted(filtered["Cliente"].dropna().astype(str).unique())
+        if not client_options:
+            st.info("No hay clientes para mostrar con los filtros actuales.")
+        else:
+            selected_client = st.selectbox("Cliente", client_options)
+            row = filtered[filtered["Cliente"].astype(str).eq(selected_client)].iloc[0]
+
+            a, b, c = st.columns(3)
+            a.metric("Etapa actual", str(row.get("Etapa", "")))
+            b.metric("Estado", str(row.get("Estado", "")))
+            date_value = row.get("Fecha próxima", "")
+            if pd.notna(date_value) and str(date_value):
+                try:
+                    date_text = pd.to_datetime(date_value).strftime("%d/%m/%Y")
+                except Exception:
+                    date_text = str(date_value)
+            else:
+                date_text = "Sin fecha"
+            c.metric("Próxima fecha", date_text)
+
+            st.markdown("#### Gestión comercial")
+            st.write("**Última gestión:**", row.get("Última gestión", "") or "Sin registrar")
+            st.write("**Próxima acción:**", row.get("Próxima acción", "") or "Sin registrar")
+            st.write("**Responsable:**", row.get("Responsable", "") or "Sin asignar")
+
+            # Datos de cliente importados
+            clients_df = pd.DataFrame(st.session_state.crm_clients)
+            if not clients_df.empty and "Cliente" in clients_df.columns:
+                info = clients_df[clients_df["Cliente"].astype(str).eq(selected_client)]
+                if not info.empty:
+                    st.markdown("#### Datos del cliente")
+                    st.dataframe(info, hide_index=True, use_container_width=True)
+
+            st.markdown("#### Línea de tiempo")
+            timeline = create_timeline(selected_client, crm_df)
+            if timeline.empty:
+                st.caption("Sin historial adicional.")
+            else:
+                st.dataframe(
+                    timeline[
+                        ["Etapa", "Última gestión", "Próxima acción",
+                         "Fecha próxima", "Responsable", "Estado", "Origen"]
+                    ],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+    with tab_new:
+        left, right = st.columns(2)
+        with left:
+            client_name = st.text_input("Cliente *", key="new_crm_client")
+            stage = st.selectbox("Etapa", CRM_STAGES, key="new_crm_stage")
+            last_action = st.text_area("Última gestión realizada", key="new_crm_last")
+        with right:
+            next_action = st.text_area("Próxima acción *", key="new_crm_next")
+            next_date = st.date_input("Fecha próxima", date.today(), key="new_crm_date")
+            owner = st.text_input("Responsable", "Andrés", key="new_crm_owner")
+            status = st.selectbox(
+                "Estado", ["Activo", "Pausado", "Ganado", "Perdido"],
+                key="new_crm_status"
+            )
+
+        if st.button("Agregar gestión", type="primary", use_container_width=True):
+            if not client_name.strip() or not next_action.strip():
                 st.warning("Completá Cliente y Próxima acción.")
+            else:
+                base = st.session_state.crm_activities or crm_df.to_dict("records")
+                base.append({
+                    "Cliente": client_name.strip(),
+                    "Etapa": stage,
+                    "Última gestión": last_action.strip(),
+                    "Próxima acción": next_action.strip(),
+                    "Fecha próxima": next_date,
+                    "Responsable": owner.strip(),
+                    "Estado": status,
+                    "Origen": "Carga manual",
+                })
+                st.session_state.crm_activities = base
+                st.success("Gestión agregada.")
+                st.rerun()
 
 
 # ============================================================
 # CLIENTES
 # ============================================================
 elif page == "👥 Clientes":
-    page_header("Clientes", "Base comercial y datos de contacto")
-    if st.session_state.imported_stats:
-        st.success("El Excel de CRM fue importado para análisis inicial.")
-        st.json(st.session_state.imported_stats, expanded=False)
-    else:
-        st.info("En la siguiente etapa migraremos la hoja CLIENTES de ESTADISTICAS.xlsx a una base de datos.")
-    st.dataframe(
-        pd.DataFrame([
-            {"Cliente": "Cliente Demo", "RUC": "", "Teléfono": "", "Correo": "", "Estado": "Activo"},
-        ]),
-        hide_index=True,
-        use_container_width=True,
-    )
+    page_header("Clientes", "Base comercial, contactos y estado de relación")
 
+    clients_df = pd.DataFrame(st.session_state.crm_clients)
+
+    if clients_df.empty:
+        st.info(
+            "Importá ESTADISTICAS.xlsx desde **Importar Excel** para construir la base inicial de clientes."
+        )
+    else:
+        search = st.text_input("Buscar", placeholder="Cliente, contacto, teléfono, correo...")
+        view = clients_df.copy()
+        if search:
+            mask = pd.Series(False, index=view.index)
+            for col in view.columns:
+                mask = mask | view[col].astype(str).str.contains(search, case=False, na=False)
+            view = view[mask]
+
+        c1, c2 = st.columns([1.8, 1])
+        with c1:
+            st.dataframe(view, hide_index=True, use_container_width=True)
+
+        with c2:
+            st.markdown("### Resumen")
+            st.metric("Clientes", len(clients_df))
+            with_phone = int(clients_df.get("Teléfono", pd.Series()).astype(str).str.strip().ne("").sum())
+            with_email = int(clients_df.get("Correo", pd.Series()).astype(str).str.strip().ne("").sum())
+            st.metric("Con teléfono", with_phone)
+            st.metric("Con correo", with_email)
 
 # ============================================================
 # PRESUPUESTOS
@@ -654,46 +1021,76 @@ elif page == "📊 Reportes":
 # IMPORTAR
 # ============================================================
 elif page == "⬆️ Importar Excel":
-    page_header("Importar datos actuales", "Usaremos tus Excel como punto de partida para la migración")
+    page_header("Importar datos actuales", "Migración inicial desde tus Excel actuales")
 
     st.warning(
-        "En este prototipo la importación sirve para analizar y previsualizar. "
-        "Los datos todavía no quedan guardados permanentemente en una base de datos."
+        "Esta V3.1 ya transforma el Excel del CRM en una estructura utilizable dentro de la app. "
+        "Todavía se guarda en memoria; la base de datos permanente viene en la próxima etapa."
     )
 
-    crm_file = st.file_uploader("ESTADISTICAS.xlsx (CRM)", type=["xlsx"], key="crm_upload")
+    crm_file = st.file_uploader(
+        "ESTADISTICAS.xlsx (CRM)",
+        type=["xlsx"],
+        key="crm_upload_v31"
+    )
+
     if crm_file:
         try:
-            sheets, previews = preview_excel(crm_file)
-            st.success("Archivo CRM leído correctamente.")
-            st.write("Hojas detectadas:", ", ".join(sheets))
-            metrics = discover_crm_metrics(crm_file)
-            st.session_state.imported_stats = metrics
+            parsed = read_crm_excel(crm_file)
+            clients_normalized = enrich_contacts(parsed["clients"], parsed["contacts"])
 
-            selected = st.selectbox("Vista previa CRM", sheets, key="crm_sheet")
-            st.dataframe(previews[selected], use_container_width=True)
+            st.session_state.crm_import = {
+                "sheets": parsed["sheets"],
+                "client_rows": len(parsed["clients"]),
+                "contact_rows": len(parsed["contacts"]),
+                "measurement_rows": len(parsed["measurements"]),
+            }
+            st.session_state.crm_clients = clients_normalized.to_dict("records")
+            st.session_state.crm_activities = parsed["activities"].to_dict("records")
+            st.session_state.imported_stats = {
+                "clientes": len(clients_normalized),
+                "contactos": len(parsed["contacts"]),
+                "etapas": parsed["activities"]["Etapa"].value_counts().to_dict()
+                    if not parsed["activities"].empty else {},
+            }
 
-            st.markdown("**Resumen detectado**")
-            st.json(metrics)
+            st.success("CRM importado y convertido.")
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Clientes", len(clients_normalized))
+            c2.metric("Contactos origen", len(parsed["contacts"]))
+            c3.metric("Oportunidades CRM", len(parsed["activities"]))
+
+            tab1, tab2, tab3 = st.tabs(["Clientes normalizados", "Pipeline generado", "Hojas detectadas"])
+            with tab1:
+                st.dataframe(clients_normalized.head(100), hide_index=True, use_container_width=True)
+            with tab2:
+                st.dataframe(parsed["activities"].head(100), hide_index=True, use_container_width=True)
+            with tab3:
+                st.write(", ".join(parsed["sheets"]))
+
+            st.info("Ahora entrá en **CRM** y **Clientes** para probar los datos importados.")
+
         except Exception as exc:
-            st.error(f"No se pudo leer el archivo CRM: {exc}")
+            st.error(f"No se pudo convertir el archivo CRM: {exc}")
 
     st.markdown("---")
 
-    flow_file = st.file_uploader("FLUJO RI SRL.xlsx (finanzas)", type=["xlsx"], key="flow_upload")
+    flow_file = st.file_uploader(
+        "FLUJO RI SRL.xlsx (finanzas)",
+        type=["xlsx"],
+        key="flow_upload_v31"
+    )
+
     if flow_file:
         try:
             sheets, previews = preview_excel(flow_file)
-            st.success("Archivo financiero leído correctamente.")
-            st.write("Hojas detectadas:", ", ".join(sheets))
             metrics = discover_flow_metrics(flow_file)
             st.session_state.imported_flow = metrics
-
-            selected = st.selectbox("Vista previa financiera", sheets, key="flow_sheet")
+            st.success("Archivo financiero leído para la siguiente etapa.")
+            st.write("Hojas detectadas:", ", ".join(sheets))
+            selected = st.selectbox("Vista previa financiera", sheets, key="flow_sheet_v31")
             st.dataframe(previews[selected], use_container_width=True)
-
-            with st.expander("Resumen técnico detectado"):
-                st.json(metrics)
         except Exception as exc:
             st.error(f"No se pudo leer el archivo financiero: {exc}")
 
@@ -712,6 +1109,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · Prototipo ERP V3</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.1 CRM</div>',
     unsafe_allow_html=True,
 )
