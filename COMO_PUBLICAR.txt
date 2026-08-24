@@ -1,0 +1,28 @@
+PASOS PARA PROBAR V3 EN INTERNET
+
+RECOMENDADO: NO REEMPLACES TODAVÍA LA APP DE OCR.
+
+1. Descomprimí este ZIP.
+2. En GitHub creá un repositorio nuevo:
+   respaldo-erp
+3. Subí:
+   - app.py
+   - requirements.txt
+   - carpeta .streamlit
+4. NO subas tus archivos ESTADISTICAS.xlsx ni FLUJO RI SRL.xlsx al GitHub público.
+5. Entrá a Streamlit Community Cloud.
+6. Crear app nueva.
+7. Repositorio: tuusuario/respaldo-erp
+8. Rama: main
+9. Archivo principal: app.py
+10. Desplegar.
+
+Cuando abra:
+- probá Dashboard;
+- probá Caja;
+- probá Productos/Stock;
+- entrá en Importar Excel y cargá tus dos archivos.
+
+IMPORTANTE:
+Esta primera V3 es un prototipo de interfaz y flujo.
+Todavía no tiene base de datos permanente.
