@@ -7,6 +7,12 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from supabase import create_client
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_RIGHT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
 
 
 st.set_page_config(
@@ -16,7 +22,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.3.1 - Supabase"
+APP_VERSION = "3.4 - Presupuestos"
 
 
 # ============================================================
@@ -358,6 +364,12 @@ def init_state():
         "crm_import": None,
         "crm_clients": [],
         "crm_activities": [],
+        "quote_items": [
+            {"Descripción": "", "Cantidad": 1.0, "Unidad": "und", "Precio Unitario": 0.0}
+        ],
+        "quote_costs": [
+            {"Categoría": "Materiales", "Descripción": "", "Cantidad": 1.0, "Costo Unitario": 0.0, "Factor": 1.70}
+        ],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -675,6 +687,208 @@ def create_timeline(client_name, crm_df):
     if crm_df is None or crm_df.empty:
         return pd.DataFrame()
     return crm_df[crm_df["Cliente"].astype(str) == str(client_name)].copy()
+
+
+# ============================================================
+# PRESUPUESTOS V3.4
+# ============================================================
+QUOTE_STATES = ["Borrador", "Enviado", "Aprobado", "Rechazado"]
+
+def pyg(value):
+    try:
+        return "Gs. " + f"{float(value):,.0f}".replace(",", ".")
+    except Exception:
+        return "Gs. 0"
+
+def next_quote_number():
+    try:
+        rows = supabase.table("presupuestos").select("numero").execute().data or []
+        nums = []
+        for row in rows:
+            m = re.search(r"RI[- ]?(\d{4})-", str(row.get("numero", "")))
+            if m:
+                nums.append(int(m.group(1)))
+        seq = max(nums, default=0) + 1
+    except Exception:
+        seq = 1
+    now = datetime.now()
+    year_code = "0" + str(now.year)[-2:]
+    return f"RI-{seq:04d}-{year_code}-{now.month:02d}"
+
+def fetch_quotes():
+    try:
+        resp = supabase.table("presupuestos").select("*").order("fecha", desc=True).execute()
+        return pd.DataFrame(resp.data or [])
+    except Exception as exc:
+        st.warning(f"No se pudieron leer los presupuestos: {exc}")
+        return pd.DataFrame()
+
+def fetch_quote_items(quote_id):
+    try:
+        resp = supabase.table("presupuesto_items").select("*").eq("presupuesto_id", quote_id).order("orden").execute()
+        return pd.DataFrame(resp.data or [])
+    except Exception:
+        return pd.DataFrame()
+
+def fetch_quote_costs(quote_id):
+    try:
+        resp = supabase.table("presupuesto_costos").select("*").eq("presupuesto_id", quote_id).order("orden").execute()
+        return pd.DataFrame(resp.data or [])
+    except Exception:
+        return pd.DataFrame()
+
+def save_quote_db(payload, items_df):
+    quote_id = payload.get("id")
+    clean = {k: v for k, v in payload.items() if k != "id"}
+    if quote_id:
+        supabase.table("presupuestos").update(clean).eq("id", quote_id).execute()
+        supabase.table("presupuesto_items").delete().eq("presupuesto_id", quote_id).execute()
+    else:
+        resp = supabase.table("presupuestos").insert(clean).execute()
+        quote_id = resp.data[0]["id"]
+
+    item_rows = []
+    for order, (_, row) in enumerate(items_df.iterrows(), 1):
+        desc = str(row.get("Descripción", "") or "").strip()
+        qty = float(row.get("Cantidad", 0) or 0)
+        price = float(row.get("Precio Unitario", 0) or 0)
+        unit = str(row.get("Unidad", "und") or "und").strip()
+        if not desc or qty <= 0:
+            continue
+        item_rows.append({
+            "presupuesto_id": quote_id,
+            "orden": order,
+            "descripcion": desc,
+            "cantidad": qty,
+            "unidad": unit,
+            "precio_unitario": price,
+            "total": qty * price,
+        })
+    if item_rows:
+        supabase.table("presupuesto_items").insert(item_rows).execute()
+    return quote_id
+
+def save_costs_db(quote_id, costs_df):
+    supabase.table("presupuesto_costos").delete().eq("presupuesto_id", quote_id).execute()
+    rows = []
+    for order, (_, row) in enumerate(costs_df.iterrows(), 1):
+        desc = str(row.get("Descripción", "") or "").strip()
+        cat = str(row.get("Categoría", "Otros") or "Otros").strip()
+        qty = float(row.get("Cantidad", 0) or 0)
+        cost = float(row.get("Costo Unitario", 0) or 0)
+        factor = float(row.get("Factor", 1) or 1)
+        if not desc or qty <= 0:
+            continue
+        total_cost = qty * cost
+        rows.append({
+            "presupuesto_id": quote_id,
+            "orden": order,
+            "categoria": cat,
+            "descripcion": desc,
+            "cantidad": qty,
+            "costo_unitario": cost,
+            "factor": factor,
+            "costo_total": total_cost,
+            "venta_sugerida": total_cost * factor,
+        })
+    if rows:
+        supabase.table("presupuesto_costos").insert(rows).execute()
+
+def quote_pdf_bytes(quote, items_df):
+    import io as _io
+    buff = _io.BytesIO()
+    doc = SimpleDocTemplate(
+        buff, pagesize=A4,
+        rightMargin=15*mm, leftMargin=15*mm,
+        topMargin=12*mm, bottomMargin=14*mm
+    )
+    styles = getSampleStyleSheet()
+    normal = ParagraphStyle("RI_Normal", parent=styles["Normal"], fontName="Helvetica", fontSize=9.3, leading=12)
+    small = ParagraphStyle("RI_Small", parent=normal, fontSize=8.3, leading=10)
+    bold = ParagraphStyle("RI_Bold", parent=normal, fontName="Helvetica-Bold")
+    title = ParagraphStyle("RI_Title", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=14, leading=16, alignment=TA_RIGHT, spaceAfter=2)
+
+    story = []
+    logo_path = Path(__file__).with_name("respaldo_logo.png")
+    if logo_path.exists():
+        story.append(RLImage(str(logo_path), width=105*mm, height=23*mm))
+    else:
+        story.append(Paragraph("<b>RESPALDO INDUSTRIAL</b>", styles["Title"]))
+
+    story.append(Paragraph(f"COTIZACIÓN Nº &nbsp; <b>{quote.get('numero','')}</b>", title))
+    story.append(Paragraph(f"FECHA &nbsp; <b>{quote.get('fecha','')}</b>", ParagraphStyle("date", parent=normal, alignment=TA_RIGHT)))
+    story.append(Spacer(1, 5*mm))
+
+    client_tbl = Table([
+        [Paragraph("<b>CLIENTE:</b>", normal), Paragraph(str(quote.get("cliente_nombre","")), bold),
+         Paragraph("<b>RUC:</b>", normal), Paragraph(str(quote.get("ruc","") or ""), bold)],
+        [Paragraph("<b>ATENCIÓN:</b>", normal), Paragraph(str(quote.get("atencion","") or ""), normal), "", ""],
+    ], colWidths=[23*mm, 89*mm, 18*mm, 45*mm])
+    client_tbl.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP"),("BOTTOMPADDING",(0,0),(-1,-1),3),("TOPPADDING",(0,0),(-1,-1),2)]))
+    story.append(client_tbl)
+    story.append(Spacer(1, 5*mm))
+
+    if quote.get("tipo","Producto") == "Servicio":
+        intro = quote.get("introduccion") or "Por medio de la presente ponemos a su consideración la siguiente propuesta comercial."
+        story.append(Paragraph(str(intro), normal))
+        story.append(Spacer(1, 5*mm))
+        if quote.get("titulo"):
+            story.append(Paragraph(f"<b>{quote.get('titulo')}</b>", normal))
+            story.append(Spacer(1, 3*mm))
+        for label, key in [("Trabajos a ser Realizados:", "trabajos"), ("INCLUYE","incluye"), ("No Incluye","no_incluye")]:
+            if quote.get(key):
+                story.append(Paragraph(f"<b>{label}</b>", normal))
+                for line in str(quote.get(key)).splitlines():
+                    if line.strip():
+                        story.append(Paragraph("• " + line.strip().lstrip("*•- "), normal))
+                story.append(Spacer(1, 3*mm))
+
+    if not items_df.empty:
+        table_data = [[Paragraph("<b>Cantidad</b>", small), Paragraph("<b>Descripción</b>", small),
+                       Paragraph("<b>Precio Unit. IVA Incl.</b>", small), Paragraph("<b>Precio Total IVA Incl.</b>", small)]]
+        for _, r in items_df.iterrows():
+            qty = float(r.get("cantidad", r.get("Cantidad", 0)) or 0)
+            desc = str(r.get("descripcion", r.get("Descripción", "")) or "")
+            unit_price = float(r.get("precio_unitario", r.get("Precio Unitario", 0)) or 0)
+            total = float(r.get("total", qty*unit_price) or 0)
+            table_data.append([f"{qty:g}", Paragraph(desc, small),
+                               f"{unit_price:,.0f}".replace(",", ".") + " Gs.",
+                               f"{total:,.0f}".replace(",", ".") + " Gs."])
+        tbl = Table(table_data, colWidths=[22*mm, 91*mm, 31*mm, 34*mm], repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("GRID",(0,0),(-1,-1),0.7,colors.black),("BACKGROUND",(0,0),(-1,0),colors.HexColor("#F2F2F2")),
+            ("VALIGN",(0,0),(-1,-1),"TOP"),("ALIGN",(0,0),(0,-1),"CENTER"),("ALIGN",(2,1),(-1,-1),"RIGHT"),
+            ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5)
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 4*mm))
+
+    subtotal = float(quote.get("subtotal",0) or 0)
+    discount = float(quote.get("descuento",0) or 0)
+    total = float(quote.get("total",0) or 0)
+    iva = float(quote.get("iva",0) or 0)
+    totals = [["Total GUARANÍES IVA inc.", pyg(subtotal)], ["DESCUENTO", pyg(discount)], ["TOTAL CON DESCUENTO", pyg(total)]] if discount > 0 else [["TOTAL IVA INCLUIDO", pyg(total)], ["IVA", pyg(iva)]]
+    t = Table(totals, colWidths=[105*mm,55*mm], hAlign="RIGHT")
+    t.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.7,colors.black),("FONTNAME",(0,0),(-1,-1),"Helvetica-Bold"),("ALIGN",(1,0),(1,-1),"RIGHT"),("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4)]))
+    story.append(t)
+    story.append(Spacer(1, 5*mm))
+
+    terms = [
+        f"<b>Cotización hecha por:</b> {quote.get('creado_por','') or ''}",
+        "<b>Esta cotización está sujeta a los siguientes términos y condiciones:</b>",
+        f"<b>Forma de Pago:</b> {quote.get('forma_pago','') or ''}",
+        f"<b>Plazo de entrega:</b> {quote.get('plazo_entrega','') or ''}",
+        f"<b>Lugar de Entrega:</b> {quote.get('lugar_entrega','') or ''}",
+        f"<b>Validez de la Oferta:</b> {quote.get('validez_dias',3)} días. Oferta válida por las cantidades ofertadas.",
+        "Esta cotización es válida con firma y sello de aceptada:"
+    ]
+    for x in terms:
+        story.append(Paragraph(x, normal)); story.append(Spacer(1,1.2*mm))
+    story.append(Spacer(1,4*mm))
+    story.append(Paragraph("<b>Gracias por hacer negocios con nosotros!</b>", ParagraphStyle("thanks", parent=normal, alignment=TA_RIGHT)))
+
+    doc.build(story)
+    return buff.getvalue()
 
 # ============================================================
 # SIDEBAR
@@ -1011,32 +1225,171 @@ elif page == "👥 Clientes":
 # PRESUPUESTOS
 # ============================================================
 elif page == "📄 Presupuestos":
-    page_header("Presupuestos", "Crear, revisar y convertir presupuestos en ventas")
+    page_header("Presupuestos", "Cotizaciones de productos y servicios vinculadas al CRM")
 
-    left, right = st.columns([1.25, 1])
-    with left:
-        st.markdown("### Presupuestos")
-        qdf = pd.DataFrame(st.session_state.quotes)
-        st.data_editor(qdf, hide_index=True, use_container_width=True, num_rows="dynamic")
+    quotes_df = fetch_quotes()
+    clients_db, _ = fetch_crm_from_db()
 
-    with right:
-        st.markdown("### Crear presupuesto")
-        q_cliente = st.text_input("Cliente", key="q_cliente")
-        q_total = st.number_input("Total estimado (Gs.)", min_value=0.0, step=100000.0)
-        q_estado = st.selectbox("Estado", ["Borrador", "Enviado", "Aprobado", "Rechazado"])
-        if st.button("Crear presupuesto", type="primary", use_container_width=True):
-            next_num = len(st.session_state.quotes) + 1
-            st.session_state.quotes.append({
-                "N°": f"PRE-{next_num:04d}",
-                "Fecha": date.today(),
-                "Cliente": q_cliente or "Sin cliente",
-                "Estado": q_estado,
-                "Total": q_total,
-            })
-            st.success("Presupuesto creado.")
-            st.rerun()
+    tab_list, tab_new, tab_cost, tab_pdf = st.tabs([
+        "📋 Mis presupuestos", "➕ Nuevo presupuesto", "🧮 Costeo interno", "📄 Vista previa / PDF"
+    ])
 
-    st.info("En la próxima iteración agregaremos productos, cantidades, precios, IVA y generación de PDF.")
+    with tab_list:
+        if quotes_df.empty:
+            st.info("Todavía no hay presupuestos guardados.")
+        else:
+            show = quotes_df.copy()
+            cols = [c for c in ["numero","fecha","cliente_nombre","tipo","estado","total","creado_por"] if c in show.columns]
+            show = show[cols].rename(columns={"numero":"N°","fecha":"Fecha","cliente_nombre":"Cliente","tipo":"Tipo","estado":"Estado","total":"Total","creado_por":"Responsable"})
+            if "Total" in show:
+                show["Total"] = show["Total"].apply(pyg)
+            st.dataframe(show, hide_index=True, use_container_width=True)
+
+    with tab_new:
+        if clients_db.empty:
+            st.warning("Primero necesitás clientes cargados en Supabase.")
+        else:
+            st.markdown("### Datos generales")
+            a,b,c = st.columns([1.1,1.5,1])
+            quote_type = a.selectbox("Tipo", ["Producto","Servicio"], key="q34_type")
+            client_name = b.selectbox("Cliente", sorted(clients_db["Cliente"].dropna().astype(str).unique()), key="q34_client")
+            q_number = c.text_input("N° Cotización", value=next_quote_number(), key="q34_number")
+
+            client_row = clients_db[clients_db["Cliente"].astype(str).eq(client_name)].iloc[0]
+            ruc_default = "" if pd.isna(client_row.get("RUC")) else str(client_row.get("RUC") or "")
+
+            c1,c2,c3 = st.columns(3)
+            q_date = c1.date_input("Fecha", date.today(), key="q34_date")
+            ruc = c2.text_input("RUC", value=ruc_default, key="q34_ruc")
+            attention = c3.text_input("Atención", key="q34_attention")
+
+            if quote_type == "Servicio":
+                st.markdown("### Alcance")
+                title_text = st.text_input("Título / sector", placeholder="Ej.: ADECUACIONES SECTOR TINTE", key="q34_title")
+                intro = st.text_area("Introducción", value="Por medio de la presente le mando un cordial saludo y a su vez poner a su consideración la siguiente propuesta comercial.", key="q34_intro")
+                works = st.text_area("Trabajos a ser realizados", height=110, key="q34_works")
+                inc1,inc2 = st.columns(2)
+                include = inc1.text_area("Incluye", height=100, key="q34_include")
+                exclude = inc2.text_area("No incluye", height=100, key="q34_exclude")
+            else:
+                title_text = intro = works = include = exclude = ""
+
+            st.markdown("### Ítems comerciales")
+            items_edit = st.data_editor(
+                pd.DataFrame(st.session_state.quote_items), hide_index=True, use_container_width=True, num_rows="dynamic",
+                column_config={
+                    "Descripción": st.column_config.TextColumn(width="large"),
+                    "Cantidad": st.column_config.NumberColumn(min_value=0.0, step=1.0),
+                    "Unidad": st.column_config.TextColumn(width="small"),
+                    "Precio Unitario": st.column_config.NumberColumn(min_value=0.0, step=1000.0, format="%.0f"),
+                }, key="quote_items_editor_v34"
+            )
+            st.session_state.quote_items = items_edit.to_dict("records")
+            items_calc = items_edit.copy()
+            for col in ["Cantidad","Precio Unitario"]:
+                items_calc[col] = pd.to_numeric(items_calc[col], errors="coerce").fillna(0)
+            subtotal = float((items_calc["Cantidad"] * items_calc["Precio Unitario"]).sum())
+
+            st.markdown("### Condiciones comerciales")
+            d1,d2,d3,d4 = st.columns(4)
+            discount_pct = d1.number_input("Descuento %", min_value=0.0, max_value=100.0, value=0.0, step=1.0, key="q34_discount")
+            payment = d2.text_input("Forma de pago", value="CONTADO", key="q34_payment")
+            delivery = d3.text_input("Plazo de entrega", value="A convenir", key="q34_delivery")
+            validity = d4.number_input("Validez (días)", min_value=1, value=3, step=1, key="q34_validity")
+            place = st.text_input("Lugar de entrega", value="En oficinas del cliente", key="q34_place")
+
+            discount = subtotal * (discount_pct/100.0)
+            total = subtotal - discount
+            iva = total/11 if total else 0
+
+            k1,k2,k3,k4 = st.columns(4)
+            k1.metric("Subtotal IVA incl.", pyg(subtotal)); k2.metric("Descuento", pyg(discount))
+            k3.metric("Total", pyg(total)); k4.metric("IVA incluido", pyg(iva))
+            q_state = st.selectbox("Estado", QUOTE_STATES, key="q34_state")
+
+            if st.button("💾 Guardar presupuesto", type="primary", use_container_width=True):
+                if not q_number.strip():
+                    st.warning("Ingresá el número de cotización.")
+                elif subtotal <= 0:
+                    st.warning("Agregá al menos un ítem con cantidad y precio.")
+                else:
+                    try:
+                        payload = {
+                            "numero":q_number.strip(),"fecha":q_date.isoformat(),"cliente_id":client_row["id"],
+                            "cliente_nombre":client_name,"ruc":ruc.strip() or None,"atencion":attention.strip() or None,
+                            "tipo":quote_type,"titulo":title_text.strip() or None,"introduccion":intro.strip() or None,
+                            "trabajos":works.strip() or None,"incluye":include.strip() or None,"no_incluye":exclude.strip() or None,
+                            "forma_pago":payment.strip() or None,"plazo_entrega":delivery.strip() or None,"lugar_entrega":place.strip() or None,
+                            "validez_dias":int(validity),"descuento_pct":float(discount_pct),"subtotal":subtotal,
+                            "descuento":discount,"total":total,"iva":iva,"estado":q_state,
+                            "creado_por":getattr(st.session_state.auth_user,"email","") or ""
+                        }
+                        quote_id = save_quote_db(payload, items_edit)
+                        st.session_state.last_quote_id = quote_id
+                        st.success(f"Presupuesto {q_number} guardado permanentemente.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error("No se pudo guardar el presupuesto."); st.caption(str(exc))
+
+    with tab_cost:
+        quotes_df = fetch_quotes()
+        if quotes_df.empty:
+            st.info("Primero guardá un presupuesto.")
+        else:
+            label_map = {f"{r['numero']} · {r['cliente_nombre']}":r["id"] for _,r in quotes_df.iterrows()}
+            chosen = st.selectbox("Presupuesto", list(label_map.keys()), key="cost_quote")
+            quote_id = label_map[chosen]
+            existing = fetch_quote_costs(quote_id)
+            costs_seed = existing.rename(columns={"categoria":"Categoría","descripcion":"Descripción","cantidad":"Cantidad","costo_unitario":"Costo Unitario","factor":"Factor"})[["Categoría","Descripción","Cantidad","Costo Unitario","Factor"]] if not existing.empty else pd.DataFrame(st.session_state.quote_costs)
+            cost_edit = st.data_editor(
+                costs_seed, hide_index=True, use_container_width=True, num_rows="dynamic",
+                column_config={
+                    "Categoría": st.column_config.SelectboxColumn(options=["Herramientas","Mano de obra","Materiales","Viaje / Viático","Mecánico","Neumático","Instrumentación","Tercerizado","Programación","Otros"]),
+                    "Descripción": st.column_config.TextColumn(width="large"),
+                    "Cantidad": st.column_config.NumberColumn(min_value=0.0, step=1.0),
+                    "Costo Unitario": st.column_config.NumberColumn(min_value=0.0, step=1000.0, format="%.0f"),
+                    "Factor": st.column_config.NumberColumn(min_value=0.0, step=0.05, format="%.2f"),
+                }, key="quote_cost_editor_v34"
+            )
+            calc = cost_edit.copy()
+            for col in ["Cantidad","Costo Unitario","Factor"]:
+                calc[col] = pd.to_numeric(calc[col], errors="coerce").fillna(0)
+            calc["Costo Total"] = calc["Cantidad"]*calc["Costo Unitario"]
+            calc["Venta Sugerida"] = calc["Costo Total"]*calc["Factor"]
+            total_cost = float(calc["Costo Total"].sum()); suggested = float(calc["Venta Sugerida"].sum())
+            qrow = quotes_df[quotes_df["id"].eq(quote_id)].iloc[0]
+            sold = float(qrow.get("total",0) or 0); margin = sold-total_cost; margin_pct=(margin/sold*100) if sold else 0
+            m1,m2,m3,m4=st.columns(4)
+            m1.metric("Costo interno",pyg(total_cost)); m2.metric("Venta sugerida",pyg(suggested)); m3.metric("Precio cotizado",pyg(sold)); m4.metric("Margen bruto",f"{margin_pct:.1f}%")
+            st.dataframe(calc, hide_index=True, use_container_width=True)
+            if st.button("💾 Guardar costeo interno", type="primary", use_container_width=True):
+                try:
+                    save_costs_db(quote_id, cost_edit)
+                    st.success("Costeo guardado. No se mostrará en el PDF del cliente."); st.rerun()
+                except Exception as exc:
+                    st.error("No se pudo guardar el costeo."); st.caption(str(exc))
+
+    with tab_pdf:
+        quotes_df = fetch_quotes()
+        if quotes_df.empty:
+            st.info("Todavía no hay presupuestos para generar PDF.")
+        else:
+            label_map={f"{r['numero']} · {r['cliente_nombre']}":r["id"] for _,r in quotes_df.iterrows()}
+            chosen=st.selectbox("Seleccionar presupuesto",list(label_map.keys()),key="pdf_quote")
+            quote_id=label_map[chosen]
+            qrow=quotes_df[quotes_df["id"].eq(quote_id)].iloc[0].to_dict()
+            items=fetch_quote_items(quote_id)
+            c1,c2,c3,c4=st.columns(4)
+            c1.metric("N°",qrow.get("numero","")); c2.metric("Cliente",qrow.get("cliente_nombre","")); c3.metric("Tipo",qrow.get("tipo","")); c4.metric("Total",pyg(qrow.get("total",0)))
+            if not items.empty:
+                st.dataframe(items[["cantidad","descripcion","precio_unitario","total"]].rename(columns={"cantidad":"Cantidad","descripcion":"Descripción","precio_unitario":"Precio Unitario","total":"Total"}), hide_index=True, use_container_width=True)
+            try:
+                pdf=quote_pdf_bytes(qrow,items)
+                filename=re.sub(r"[^A-Za-z0-9._-]+","_",f"{qrow.get('numero','cotizacion')}_{qrow.get('cliente_nombre','cliente')}")+".pdf"
+                st.download_button("⬇️ Descargar PDF",data=pdf,file_name=filename,mime="application/pdf",type="primary",use_container_width=True)
+                st.caption("El PDF comercial no incluye el costeo interno.")
+            except Exception as exc:
+                st.error("No se pudo generar el PDF."); st.caption(str(exc))
 
 
 # ============================================================
@@ -1285,6 +1638,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.3.1 Supabase</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.4 Presupuestos</div>',
     unsafe_allow_html=True,
 )
