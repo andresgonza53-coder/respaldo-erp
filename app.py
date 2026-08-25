@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from supabase import create_client
 
 
 st.set_page_config(
@@ -15,7 +16,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.2 - CRM Real"
+APP_VERSION = "3.3 - Supabase"
 
 
 # ============================================================
@@ -136,6 +137,168 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+
+
+# ============================================================
+# SUPABASE / AUTENTICACIÓN
+# ============================================================
+def get_supabase():
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+        return create_client(url, key)
+    except Exception as exc:
+        st.error("No se pudo inicializar Supabase. Revisá los Secrets de Streamlit.")
+        st.exception(exc)
+        st.stop()
+
+supabase = get_supabase()
+
+def ensure_login():
+    if "auth_user" not in st.session_state:
+        st.session_state.auth_user = None
+    if "auth_session" not in st.session_state:
+        st.session_state.auth_session = None
+
+    if st.session_state.auth_user is not None:
+        return
+
+    st.markdown("## 🔐 Acceso al ERP")
+    st.caption("Ingresá con el usuario creado en Supabase Authentication.")
+    email = st.text_input("Correo")
+    password = st.text_input("Contraseña", type="password")
+
+    if st.button("Ingresar", type="primary", use_container_width=True):
+        try:
+            res = supabase.auth.sign_in_with_password({
+                "email": email.strip(),
+                "password": password
+            })
+            st.session_state.auth_user = res.user
+            st.session_state.auth_session = res.session
+            st.success("Acceso correcto.")
+            st.rerun()
+        except Exception as exc:
+            st.error("No se pudo iniciar sesión. Revisá correo/contraseña o las políticas de Supabase.")
+            st.caption(str(exc))
+    st.stop()
+
+ensure_login()
+
+def logout():
+    try:
+        supabase.auth.sign_out()
+    except Exception:
+        pass
+    st.session_state.auth_user = None
+    st.session_state.auth_session = None
+    st.rerun()
+
+def fetch_crm_from_db():
+    """Devuelve clientes y oportunidades desde Supabase."""
+    try:
+        clients_resp = supabase.table("clientes").select("*").order("nombre").execute()
+        opp_resp = supabase.table("oportunidades").select(
+            "id,cliente_id,etapa,estado,responsable,proxima_accion,fecha_proxima,observacion,origen,clientes(nombre)"
+        ).execute()
+
+        clients = clients_resp.data or []
+        opps = opp_resp.data or []
+
+        client_df = pd.DataFrame([{
+            "id": c.get("id"),
+            "Cliente": c.get("nombre",""),
+            "RUC": c.get("ruc",""),
+            "Ciudad": c.get("ciudad",""),
+            "Dirección": c.get("direccion",""),
+            "Teléfono": c.get("telefono",""),
+            "Correo": c.get("correo",""),
+            "Estado": c.get("estado","Activo"),
+        } for c in clients])
+
+        crm_rows = []
+        for o in opps:
+            cliente = o.get("clientes") or {}
+            crm_rows.append({
+                "id": o.get("id"),
+                "cliente_id": o.get("cliente_id"),
+                "Cliente": cliente.get("nombre","") if isinstance(cliente, dict) else "",
+                "Etapa": o.get("etapa","Acercamiento"),
+                "Última gestión": o.get("observacion","") or "",
+                "Próxima acción": o.get("proxima_accion","") or "",
+                "Fecha próxima": o.get("fecha_proxima"),
+                "Responsable": o.get("responsable","") or "",
+                "Estado": o.get("estado","Activo"),
+                "Origen": o.get("origen","CRM"),
+            })
+        return client_df, pd.DataFrame(crm_rows)
+    except Exception as exc:
+        st.error("No se pudieron leer los datos desde Supabase.")
+        st.caption(str(exc))
+        return pd.DataFrame(), pd.DataFrame()
+
+def db_upsert_client(record):
+    payload = {
+        "nombre": str(record.get("Cliente","")).strip(),
+        "ruc": str(record.get("RUC","")).strip() or None,
+        "ciudad": str(record.get("Ciudad","")).strip() or None,
+        "direccion": str(record.get("Dirección","")).strip() or None,
+        "telefono": str(record.get("Teléfono","")).strip() or None,
+        "correo": str(record.get("Correo","")).strip() or None,
+        "estado": str(record.get("Estado","Activo")).strip() or "Activo",
+        "origen": "ESTADISTICAS.xlsx",
+    }
+    res = supabase.table("clientes").upsert(payload, on_conflict="nombre").execute()
+    return (res.data or [None])[0]
+
+def db_get_client_id_by_name(name):
+    res = supabase.table("clientes").select("id").ilike("nombre", name.strip()).limit(1).execute()
+    rows = res.data or []
+    return rows[0]["id"] if rows else None
+
+def db_upsert_opportunity(record, client_id):
+    payload = {
+        "cliente_id": client_id,
+        "etapa": record.get("Etapa") or "Acercamiento",
+        "estado": record.get("Estado") or "Activo",
+        "responsable": record.get("Responsable") or None,
+        "proxima_accion": record.get("Próxima acción") or None,
+        "fecha_proxima": (
+            pd.to_datetime(record.get("Fecha próxima")).date().isoformat()
+            if pd.notna(record.get("Fecha próxima")) and str(record.get("Fecha próxima")).strip()
+            else None
+        ),
+        "observacion": record.get("Última gestión") or None,
+        "origen": record.get("Origen") or "CRM",
+    }
+
+    # Si existe una oportunidad para el cliente, la actualiza.
+    existing = supabase.table("oportunidades").select("id").eq("cliente_id", client_id).limit(1).execute()
+    if existing.data:
+        return supabase.table("oportunidades").update(payload).eq("id", existing.data[0]["id"]).execute()
+    return supabase.table("oportunidades").insert(payload).execute()
+
+def db_add_gestion(client_id, opportunity_id, tipo, descripcion, resultado, proxima_accion, fecha_proxima, responsable):
+    payload = {
+        "cliente_id": client_id,
+        "oportunidad_id": opportunity_id,
+        "tipo": tipo,
+        "descripcion": descripcion or None,
+        "resultado": resultado or None,
+        "proxima_accion": proxima_accion or None,
+        "fecha_proxima": fecha_proxima.isoformat() if fecha_proxima else None,
+        "responsable": responsable or None,
+    }
+    return supabase.table("gestiones_crm").insert(payload).execute()
+
+def db_timeline(client_id):
+    try:
+        res = supabase.table("gestiones_crm").select(
+            "tipo,descripcion,resultado,proxima_accion,fecha_proxima,responsable,creado_en"
+        ).eq("cliente_id", client_id).order("creado_en", desc=True).execute()
+        return pd.DataFrame(res.data or [])
+    except Exception:
+        return pd.DataFrame()
 
 # ============================================================
 # ESTADO / DEMO
@@ -512,8 +675,14 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.caption("Prototipo web")
-    st.caption("Datos no persistentes todavía")
+    try:
+        user_email = st.session_state.auth_user.email
+    except Exception:
+        user_email = ""
+    st.caption(f"👤 {user_email}")
+    if st.button("Cerrar sesión", use_container_width=True):
+        logout()
+    st.caption("✅ Supabase conectado")
 
 
 # ============================================================
@@ -608,46 +777,28 @@ if page == "🏠 Inicio":
 # CRM
 # ============================================================
 elif page == "🤝 CRM":
-    page_header("CRM", "Seguimiento comercial desde acercamiento hasta cierre")
+    page_header("CRM", "Seguimiento comercial persistente en Supabase")
 
-    # Fuente principal: importación del Excel, si existe.
-    if st.session_state.crm_activities:
-        crm_df = pd.DataFrame(st.session_state.crm_activities)
-    else:
-        crm_df = pd.DataFrame(st.session_state.crm)
+    clients_db, crm_df = fetch_crm_from_db()
 
-        if not crm_df.empty:
-            crm_df = crm_df.rename(columns={"Fecha": "Fecha próxima"})
-            if "Última gestión" not in crm_df:
-                crm_df["Última gestión"] = ""
-            if "Estado" not in crm_df:
-                crm_df["Estado"] = "Activo"
-            if "Origen" not in crm_df:
-                crm_df["Origen"] = "Demo"
-
-    for col in ["Cliente", "Etapa", "Última gestión", "Próxima acción",
-                "Fecha próxima", "Responsable", "Estado", "Origen"]:
-        if col not in crm_df.columns:
-            crm_df[col] = ""
+    if crm_df.empty:
+        st.info("Todavía no hay oportunidades guardadas en Supabase. Importá ESTADISTICAS.xlsx desde **Importar Excel**.")
+        crm_df = pd.DataFrame(columns=[
+            "id","cliente_id","Cliente","Etapa","Última gestión","Próxima acción",
+            "Fecha próxima","Responsable","Estado","Origen"
+        ])
 
     crm_df["Fecha próxima"] = pd.to_datetime(crm_df["Fecha próxima"], errors="coerce")
     metrics = crm_kpis(crm_df)
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        kpi("Clientes / oportunidades", metrics["total"])
-    with c2:
-        kpi("Pendientes con fecha", metrics["pending"])
-    with c3:
-        kpi("Seguimientos vencidos", metrics["overdue"])
-    with c4:
-        kpi("En presupuesto", metrics["quotes"])
-    with c5:
-        kpi("En cierre", metrics["closed"])
+    with c1: kpi("Clientes / oportunidades", metrics["total"])
+    with c2: kpi("Pendientes con fecha", metrics["pending"])
+    with c3: kpi("Seguimientos vencidos", metrics["overdue"])
+    with c4: kpi("En presupuesto", metrics["quotes"])
+    with c5: kpi("En cierre", metrics["closed"])
 
     st.write("")
-
-    # Filtros
     f1, f2, f3, f4 = st.columns([1.4, 1, 1, 1])
     search = f1.text_input("Buscar cliente", placeholder="Empresa, cliente...")
     stage_filter = f2.multiselect("Etapa", CRM_STAGES, default=[])
@@ -657,9 +808,7 @@ elif page == "🤝 CRM":
 
     filtered = crm_df.copy()
     if search:
-        filtered = filtered[
-            filtered["Cliente"].astype(str).str.contains(search, case=False, na=False)
-        ]
+        filtered = filtered[filtered["Cliente"].astype(str).str.contains(search, case=False, na=False)]
     if stage_filter:
         filtered = filtered[filtered["Etapa"].isin(stage_filter)]
     if owner_filter:
@@ -673,50 +822,51 @@ elif page == "🤝 CRM":
 
     with tab_pipeline:
         st.markdown("#### Oportunidades")
+        display_cols = ["Cliente","Etapa","Última gestión","Próxima acción","Fecha próxima","Responsable","Estado","Origen"]
         edited = st.data_editor(
-            filtered[
-                ["Cliente", "Etapa", "Última gestión", "Próxima acción",
-                 "Fecha próxima", "Responsable", "Estado", "Origen"]
-            ],
+            filtered[display_cols],
             hide_index=True,
             use_container_width=True,
-            num_rows="dynamic",
+            num_rows="fixed",
             column_config={
+                "Cliente": st.column_config.TextColumn(disabled=True),
                 "Etapa": st.column_config.SelectboxColumn("Etapa", options=CRM_STAGES),
                 "Fecha próxima": st.column_config.DateColumn("Fecha próxima", format="DD/MM/YYYY"),
-                "Estado": st.column_config.SelectboxColumn(
-                    "Estado", options=["Activo", "Pausado", "Ganado", "Perdido"]
-                ),
+                "Estado": st.column_config.SelectboxColumn("Estado", options=["Activo","Pausado","Ganado","Perdido"]),
+                "Origen": st.column_config.TextColumn(disabled=True),
             },
-            key="crm_pipeline_editor",
+            key="crm_pipeline_editor_db",
         )
 
         if st.button("💾 Guardar cambios del CRM", type="primary"):
-            if st.session_state.crm_activities:
-                # Actualiza por Cliente en esta primera versión.
-                original = pd.DataFrame(st.session_state.crm_activities)
-                for _, row in edited.iterrows():
-                    mask = original["Cliente"].astype(str).eq(str(row["Cliente"]))
-                    if mask.any():
-                        for col in edited.columns:
-                            original.loc[mask, col] = row[col]
-                    else:
-                        original = pd.concat([original, pd.DataFrame([row])], ignore_index=True)
-                st.session_state.crm_activities = original.to_dict("records")
-            else:
-                st.session_state.crm_activities = edited.to_dict("records")
-            st.success("Cambios guardados temporalmente.")
-            st.rerun()
-
-        st.caption(
-            "En la próxima etapa estos cambios quedarán guardados permanentemente en una base de datos."
-        )
+            with st.spinner("Guardando en Supabase..."):
+                try:
+                    for idx, row in edited.iterrows():
+                        client_name = str(row["Cliente"])
+                        orig = filtered[filtered["Cliente"].astype(str).eq(client_name)]
+                        if orig.empty:
+                            continue
+                        opportunity_id = orig.iloc[0]["id"]
+                        payload = {
+                            "etapa": row["Etapa"],
+                            "estado": row["Estado"],
+                            "responsable": row["Responsable"] or None,
+                            "proxima_accion": row["Próxima acción"] or None,
+                            "fecha_proxima": (
+                                pd.to_datetime(row["Fecha próxima"]).date().isoformat()
+                                if pd.notna(row["Fecha próxima"]) else None
+                            ),
+                            "observacion": row["Última gestión"] or None,
+                        }
+                        supabase.table("oportunidades").update(payload).eq("id", opportunity_id).execute()
+                    st.success("Cambios guardados permanentemente.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error("No se pudieron guardar los cambios.")
+                    st.caption(str(exc))
 
     with tab_actions:
-        actions = crm_df.copy()
-        actions["Fecha próxima"] = pd.to_datetime(actions["Fecha próxima"], errors="coerce")
-        actions = actions[actions["Fecha próxima"].notna()].sort_values("Fecha próxima")
-
+        actions = crm_df[crm_df["Fecha próxima"].notna()].sort_values("Fecha próxima").copy()
         if actions.empty:
             st.info("No hay acciones con fecha asignada.")
         else:
@@ -725,12 +875,8 @@ elif page == "🤝 CRM":
                 lambda x: "VENCIDA" if x < today_ts else ("HOY" if x == today_ts else "PRÓXIMA")
             )
             st.dataframe(
-                actions[
-                    ["Situación", "Fecha próxima", "Cliente", "Etapa",
-                     "Próxima acción", "Responsable", "Estado"]
-                ],
-                hide_index=True,
-                use_container_width=True,
+                actions[["Situación","Fecha próxima","Cliente","Etapa","Próxima acción","Responsable","Estado"]],
+                hide_index=True, use_container_width=True
             )
 
     with tab_client:
@@ -740,114 +886,96 @@ elif page == "🤝 CRM":
         else:
             selected_client = st.selectbox("Cliente", client_options)
             row = filtered[filtered["Cliente"].astype(str).eq(selected_client)].iloc[0]
-
-            a, b, c = st.columns(3)
-            a.metric("Etapa actual", str(row.get("Etapa", "")))
-            b.metric("Estado", str(row.get("Estado", "")))
-            date_value = row.get("Fecha próxima", "")
-            if pd.notna(date_value) and str(date_value):
-                try:
-                    date_text = pd.to_datetime(date_value).strftime("%d/%m/%Y")
-                except Exception:
-                    date_text = str(date_value)
+            a,b,c = st.columns(3)
+            a.metric("Etapa actual", str(row.get("Etapa","")))
+            b.metric("Estado", str(row.get("Estado","")))
+            if pd.notna(row.get("Fecha próxima")):
+                c.metric("Próxima fecha", pd.to_datetime(row["Fecha próxima"]).strftime("%d/%m/%Y"))
             else:
-                date_text = "Sin fecha"
-            c.metric("Próxima fecha", date_text)
+                c.metric("Próxima fecha", "Sin fecha")
 
-            st.markdown("#### Gestión comercial")
-            st.write("**Última gestión:**", row.get("Última gestión", "") or "Sin registrar")
-            st.write("**Próxima acción:**", row.get("Próxima acción", "") or "Sin registrar")
-            st.write("**Responsable:**", row.get("Responsable", "") or "Sin asignar")
+            info = clients_db[clients_db["Cliente"].astype(str).eq(selected_client)] if not clients_db.empty else pd.DataFrame()
+            if not info.empty:
+                st.markdown("#### Datos del cliente")
+                st.dataframe(info.drop(columns=["id"], errors="ignore"), hide_index=True, use_container_width=True)
 
-            # Datos de cliente importados
-            clients_df = pd.DataFrame(st.session_state.crm_clients)
-            if not clients_df.empty and "Cliente" in clients_df.columns:
-                info = clients_df[clients_df["Cliente"].astype(str).eq(selected_client)]
-                if not info.empty:
-                    st.markdown("#### Datos del cliente")
-                    st.dataframe(info, hide_index=True, use_container_width=True)
-
-            st.markdown("#### Línea de tiempo")
-            timeline = create_timeline(selected_client, crm_df)
+            st.markdown("#### Historial de gestiones")
+            timeline = db_timeline(row["cliente_id"])
             if timeline.empty:
-                st.caption("Sin historial adicional.")
+                st.caption("Todavía no hay gestiones registradas.")
             else:
-                st.dataframe(
-                    timeline[
-                        ["Etapa", "Última gestión", "Próxima acción",
-                         "Fecha próxima", "Responsable", "Estado", "Origen"]
-                    ],
-                    hide_index=True,
-                    use_container_width=True,
-                )
+                st.dataframe(timeline, hide_index=True, use_container_width=True)
 
     with tab_new:
-        left, right = st.columns(2)
-        with left:
-            client_name = st.text_input("Cliente *", key="new_crm_client")
-            stage = st.selectbox("Etapa", CRM_STAGES, key="new_crm_stage")
-            last_action = st.text_area("Última gestión realizada", key="new_crm_last")
-        with right:
-            next_action = st.text_area("Próxima acción *", key="new_crm_next")
-            next_date = st.date_input("Fecha próxima", date.today(), key="new_crm_date")
-            owner = st.text_input("Responsable", "Andrés", key="new_crm_owner")
-            status = st.selectbox(
-                "Estado", ["Activo", "Pausado", "Ganado", "Perdido"],
-                key="new_crm_status"
-            )
+        if clients_db.empty:
+            st.info("Primero importá clientes a Supabase.")
+        else:
+            client_name = st.selectbox("Cliente *", sorted(clients_db["Cliente"].dropna().astype(str).unique()))
+            tipo = st.selectbox("Tipo", ["Llamada","WhatsApp","Correo","Visita","Relevamiento","Presupuesto","Seguimiento","Otro"])
+            stage = st.selectbox("Etapa actual", CRM_STAGES)
+            descripcion = st.text_area("Gestión realizada")
+            resultado = st.text_area("Resultado")
+            next_action = st.text_area("Próxima acción")
+            next_date = st.date_input("Fecha próxima", date.today())
+            owner = st.text_input("Responsable", "Andrés")
 
-        if st.button("Agregar gestión", type="primary", use_container_width=True):
-            if not client_name.strip() or not next_action.strip():
-                st.warning("Completá Cliente y Próxima acción.")
-            else:
-                base = st.session_state.crm_activities or crm_df.to_dict("records")
-                base.append({
-                    "Cliente": client_name.strip(),
-                    "Etapa": stage,
-                    "Última gestión": last_action.strip(),
-                    "Próxima acción": next_action.strip(),
-                    "Fecha próxima": next_date,
-                    "Responsable": owner.strip(),
-                    "Estado": status,
-                    "Origen": "Carga manual",
-                })
-                st.session_state.crm_activities = base
-                st.success("Gestión agregada.")
-                st.rerun()
+            if st.button("Guardar gestión", type="primary", use_container_width=True):
+                try:
+                    client_row = clients_db[clients_db["Cliente"].astype(str).eq(client_name)].iloc[0]
+                    client_id = client_row["id"]
+
+                    opp = supabase.table("oportunidades").select("id").eq("cliente_id", client_id).limit(1).execute()
+                    if opp.data:
+                        opportunity_id = opp.data[0]["id"]
+                        supabase.table("oportunidades").update({
+                            "etapa": stage,
+                            "responsable": owner or None,
+                            "proxima_accion": next_action or None,
+                            "fecha_proxima": next_date.isoformat() if next_action else None,
+                            "observacion": resultado or descripcion or None,
+                        }).eq("id", opportunity_id).execute()
+                    else:
+                        created = supabase.table("oportunidades").insert({
+                            "cliente_id": client_id,
+                            "etapa": stage,
+                            "estado": "Activo",
+                            "responsable": owner or None,
+                            "proxima_accion": next_action or None,
+                            "fecha_proxima": next_date.isoformat() if next_action else None,
+                            "observacion": resultado or descripcion or None,
+                            "origen": "CRM",
+                        }).execute()
+                        opportunity_id = created.data[0]["id"]
+
+                    db_add_gestion(
+                        client_id, opportunity_id, tipo, descripcion, resultado,
+                        next_action, next_date if next_action else None, owner
+                    )
+                    st.success("Gestión guardada permanentemente.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error("No se pudo guardar la gestión.")
+                    st.caption(str(exc))
 
 
 # ============================================================
 # CLIENTES
 # ============================================================
 elif page == "👥 Clientes":
-    page_header("Clientes", "Base comercial, contactos y estado de relación")
-
-    clients_df = pd.DataFrame(st.session_state.crm_clients)
+    page_header("Clientes", "Base comercial persistente en Supabase")
+    clients_df, _ = fetch_crm_from_db()
 
     if clients_df.empty:
-        st.info(
-            "Importá ESTADISTICAS.xlsx desde **Importar Excel** para construir la base inicial de clientes."
-        )
+        st.info("Todavía no hay clientes guardados. Usá **Importar Excel** para migrar la base inicial.")
     else:
-        search = st.text_input("Buscar", placeholder="Cliente, contacto, teléfono, correo...")
+        search = st.text_input("Buscar", placeholder="Cliente, RUC, teléfono, correo...")
         view = clients_df.copy()
         if search:
             mask = pd.Series(False, index=view.index)
             for col in view.columns:
                 mask = mask | view[col].astype(str).str.contains(search, case=False, na=False)
             view = view[mask]
-
-        c1, c2 = st.columns([1.8, 1])
-        with c1:
-            st.dataframe(view, hide_index=True, use_container_width=True)
-
-        with c2:
-            st.markdown("### Resumen")
-            st.metric("Clientes", len(clients_df))
-            with_phone = int(clients_df.get("Teléfono", pd.Series()).astype(str).str.strip().ne("").sum())
-            with_email = int(clients_df.get("Correo", pd.Series()).astype(str).str.strip().ne("").sum())
-            st.metric("Con teléfono", with_phone)
-            st.metric("Con correo", with_email)
+        st.dataframe(view.drop(columns=["id"], errors="ignore"), hide_index=True, use_container_width=True)
 
 # ============================================================
 # PRESUPUESTOS
@@ -1036,78 +1164,82 @@ elif page == "📊 Reportes":
 # IMPORTAR
 # ============================================================
 elif page == "⬆️ Importar Excel":
-    page_header("Importar datos actuales", "Migración inicial desde tus Excel actuales")
+    page_header("Importar datos actuales", "Migración inicial hacia Supabase")
 
-    st.warning(
-        "Esta V3.1 ya transforma el Excel del CRM en una estructura utilizable dentro de la app. "
-        "Todavía se guarda en memoria; la base de datos permanente viene en la próxima etapa."
-    )
+    st.success("Esta versión permite migrar el CRM a la base de datos permanente.")
 
-    crm_file = st.file_uploader(
-        "ESTADISTICAS.xlsx (CRM)",
-        type=["xlsx"],
-        key="crm_upload_v31"
-    )
+    crm_file = st.file_uploader("ESTADISTICAS.xlsx (CRM)", type=["xlsx"], key="crm_upload_v33")
 
     if crm_file:
         try:
             parsed = read_crm_excel(crm_file)
             clients_normalized = enrich_contacts(parsed["clients"], parsed["contacts"])
 
-            st.session_state.crm_import = {
-                "sheets": parsed["sheets"],
-                "client_rows": len(parsed["clients"]),
-                "contact_rows": len(parsed["contacts"]),
-                "measurement_rows": len(parsed["measurements"]),
-            }
-            st.session_state.crm_clients = clients_normalized.to_dict("records")
-            st.session_state.crm_activities = parsed["activities"].to_dict("records")
-            st.session_state.imported_stats = {
-                "clientes": len(clients_normalized),
-                "contactos": len(parsed["contacts"]),
-                "etapas": parsed["activities"]["Etapa"].value_counts().to_dict()
-                    if not parsed["activities"].empty else {},
-            }
-
-            st.success("CRM importado y convertido.")
-
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Clientes", len(clients_normalized))
+            c1,c2,c3 = st.columns(3)
+            c1.metric("Clientes detectados", len(clients_normalized))
             c2.metric("Contactos origen", len(parsed["contacts"]))
-            c3.metric("Oportunidades CRM", len(parsed["activities"]))
+            c3.metric("Oportunidades detectadas", len(parsed["activities"]))
 
-            tab1, tab2, tab3 = st.tabs(["Clientes normalizados", "Pipeline generado", "Hojas detectadas"])
+            tab1,tab2 = st.tabs(["Vista previa clientes","Vista previa pipeline"])
             with tab1:
                 st.dataframe(clients_normalized.head(100), hide_index=True, use_container_width=True)
             with tab2:
                 st.dataframe(parsed["activities"].head(100), hide_index=True, use_container_width=True)
-            with tab3:
-                st.write(", ".join(parsed["sheets"]))
 
-            st.info("Ahora entrá en **CRM** y **Clientes** para probar los datos importados.")
+            st.warning("La migración hace upsert por nombre de cliente para evitar duplicados por reintentos.")
+
+            if st.button("🚀 Migrar CRM a Supabase", type="primary", use_container_width=True):
+                progress = st.progress(0)
+                status = st.empty()
+                errors = []
+
+                total = max(len(clients_normalized), 1)
+                for i, (_, client_row) in enumerate(clients_normalized.iterrows(), 1):
+                    try:
+                        client_record = {
+                            "Cliente": client_row.get("Cliente",""),
+                            "Ciudad": client_row.get("Ciudad",""),
+                            "Teléfono": client_row.get("Teléfono",""),
+                            "Correo": client_row.get("Correo",""),
+                            "Estado": "Activo",
+                        }
+                        inserted = db_upsert_client(client_record)
+                        client_id = inserted.get("id") if inserted else db_get_client_id_by_name(client_record["Cliente"])
+                        if not client_id:
+                            raise RuntimeError("No se pudo obtener cliente_id")
+
+                        act = parsed["activities"][
+                            parsed["activities"]["Cliente"].astype(str).eq(str(client_record["Cliente"]))
+                        ]
+                        if not act.empty:
+                            db_upsert_opportunity(act.iloc[0].to_dict(), client_id)
+                        else:
+                            db_upsert_opportunity({
+                                "Etapa":"Acercamiento","Estado":"Activo","Origen":"ESTADISTICAS.xlsx"
+                            }, client_id)
+
+                    except Exception as exc:
+                        errors.append(f"{client_row.get('Cliente','')}: {exc}")
+
+                    progress.progress(i / total)
+                    status.write(f"Migrando {i} de {total}...")
+
+                if errors:
+                    st.warning(f"Migración terminada con {len(errors)} observaciones.")
+                    with st.expander("Ver observaciones"):
+                        st.write(errors[:50])
+                else:
+                    st.success("Migración completada correctamente.")
+
+                st.info("Entrá en **CRM** o **Clientes** para verificar los datos guardados.")
 
         except Exception as exc:
-            st.error(f"No se pudo convertir el archivo CRM: {exc}")
+            st.error(f"No se pudo preparar la migración: {exc}")
 
     st.markdown("---")
-
-    flow_file = st.file_uploader(
-        "FLUJO RI SRL.xlsx (finanzas)",
-        type=["xlsx"],
-        key="flow_upload_v31"
-    )
-
+    flow_file = st.file_uploader("FLUJO RI SRL.xlsx (finanzas)", type=["xlsx"], key="flow_upload_v33")
     if flow_file:
-        try:
-            sheets, previews = preview_excel(flow_file)
-            metrics = discover_flow_metrics(flow_file)
-            st.session_state.imported_flow = metrics
-            st.success("Archivo financiero leído para la siguiente etapa.")
-            st.write("Hojas detectadas:", ", ".join(sheets))
-            selected = st.selectbox("Vista previa financiera", sheets, key="flow_sheet_v31")
-            st.dataframe(previews[selected], use_container_width=True)
-        except Exception as exc:
-            st.error(f"No se pudo leer el archivo financiero: {exc}")
+        st.info("La migración financiera se implementará después de estabilizar CRM + Clientes.")
 
 
 # ============================================================
@@ -1118,12 +1250,11 @@ elif page == "⚙️ Configuración":
     st.text_input("Empresa", "Respaldo Industrial SRL")
     st.selectbox("Moneda principal", ["PYG - Guaraní", "USD - Dólar"])
     st.selectbox("Formato de fecha", ["DD/MM/YYYY"])
-    st.info(
-        "Antes de usar el ERP en producción agregaremos usuarios, contraseñas, permisos y una base de datos persistente."
-    )
+    st.success("Supabase está configurado para CRM + Clientes.")
+    st.info("Los próximos módulos en migrarse serán Productos/Stock, Presupuestos, Caja y Compras.")
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.2 CRM Real</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.3 Supabase</div>',
     unsafe_allow_html=True,
 )
