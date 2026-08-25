@@ -22,7 +22,110 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.4 - Presupuestos"
+APP_VERSION = "3.5 - Materiales"
+
+
+st.markdown("""
+<style>
+/* ===== Mobile responsive adjustments ===== */
+@media (max-width: 768px) {
+    .block-container {
+        padding-top: 1rem !important;
+        padding-left: 0.8rem !important;
+        padding-right: 0.8rem !important;
+        padding-bottom: 2rem !important;
+    }
+
+    h1, .stHeading h1 {
+        font-size: 2rem !important;
+        line-height: 1.1 !important;
+    }
+
+    /* Tabs: allow horizontal scrolling instead of clipping */
+    div[data-baseweb="tab-list"] {
+        overflow-x: auto !important;
+        flex-wrap: nowrap !important;
+        scrollbar-width: thin;
+        gap: 0.25rem !important;
+    }
+    button[data-baseweb="tab"] {
+        white-space: nowrap !important;
+        min-width: max-content !important;
+        padding-left: 0.55rem !important;
+        padding-right: 0.55rem !important;
+        font-size: 0.88rem !important;
+    }
+
+    /* Make metrics/cards breathe less on phones */
+    div[data-testid="stMetric"] {
+        padding: 0.4rem 0.2rem !important;
+    }
+
+    /* Form controls */
+    .stButton > button,
+    .stDownloadButton > button {
+        min-height: 2.8rem !important;
+        font-size: 0.95rem !important;
+    }
+
+    /* Dataframes remain usable if shown */
+    div[data-testid="stDataFrame"] {
+        overflow-x: auto !important;
+    }
+
+    /* Quote mobile cards */
+    .quote-mobile-card {
+        border: 1px solid #E5E7EB;
+        border-radius: 14px;
+        padding: 0.9rem;
+        margin-bottom: 0.75rem;
+        background: white;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    }
+    .quote-mobile-top {
+        display: flex;
+        justify-content: space-between;
+        gap: 0.75rem;
+        align-items: flex-start;
+    }
+    .quote-mobile-number {
+        font-weight: 700;
+        font-size: 1rem;
+    }
+    .quote-mobile-client {
+        font-size: 1.02rem;
+        font-weight: 700;
+        margin-top: 0.25rem;
+    }
+    .quote-mobile-meta {
+        font-size: 0.86rem;
+        color: #64748B;
+        margin-top: 0.25rem;
+    }
+    .quote-mobile-total {
+        font-weight: 800;
+        font-size: 1rem;
+        margin-top: 0.5rem;
+    }
+    .quote-mobile-badge {
+        display: inline-block;
+        padding: 0.18rem 0.55rem;
+        border-radius: 999px;
+        background: #F1F5F9;
+        font-size: 0.75rem;
+        font-weight: 700;
+    }
+}
+
+/* Desktop-only and mobile-only helpers */
+.mobile-only { display: none; }
+@media (max-width: 768px) {
+    .desktop-only { display: none !important; }
+    .mobile-only { display: block !important; }
+}
+</style>
+""", unsafe_allow_html=True)
+
 
 
 # ============================================================
@@ -890,6 +993,132 @@ def quote_pdf_bytes(quote, items_df):
     doc.build(story)
     return buff.getvalue()
 
+
+# ============================================================
+# MATERIALES / PROVEEDORES V3.5
+# ============================================================
+MATERIAL_CATEGORIES = [
+    "Contactor", "Relé", "Transmisor", "Bornera", "Interruptor",
+    "Disyuntor", "Sensor", "Variador", "PLC", "HMI", "Fuente",
+    "Cable", "Protección", "Instrumentación", "Neumática",
+    "Mecánica", "Otro"
+]
+
+def fetch_suppliers():
+    try:
+        return pd.DataFrame(supabase.table("proveedores").select("*").order("nombre").execute().data or [])
+    except Exception as exc:
+        st.warning(f"No se pudieron leer los proveedores: {exc}")
+        return pd.DataFrame()
+
+def fetch_materials():
+    try:
+        return pd.DataFrame(supabase.table("materiales").select("*").order("nombre").execute().data or [])
+    except Exception as exc:
+        st.warning(f"No se pudieron leer los materiales: {exc}")
+        return pd.DataFrame()
+
+def fetch_material_supplier():
+    try:
+        resp = supabase.table("material_proveedor").select(
+            "id,material_id,proveedor_id,prioridad,codigo_proveedor,plazo_dias,observacion,"
+            "materiales(nombre,marca,modelo,categoria),proveedores(nombre)"
+        ).execute()
+        rows = []
+        for r in resp.data or []:
+            m = r.get("materiales") or {}
+            p = r.get("proveedores") or {}
+            rows.append({
+                "id": r.get("id"),
+                "material_id": r.get("material_id"),
+                "proveedor_id": r.get("proveedor_id"),
+                "Material": m.get("nombre","") if isinstance(m, dict) else "",
+                "Marca": m.get("marca","") if isinstance(m, dict) else "",
+                "Modelo": m.get("modelo","") if isinstance(m, dict) else "",
+                "Categoría": m.get("categoria","") if isinstance(m, dict) else "",
+                "Proveedor": p.get("nombre","") if isinstance(p, dict) else "",
+                "Prioridad": r.get("prioridad", 3),
+                "Código proveedor": r.get("codigo_proveedor","") or "",
+                "Plazo días": r.get("plazo_dias"),
+                "Observación": r.get("observacion","") or "",
+            })
+        return pd.DataFrame(rows)
+    except Exception as exc:
+        st.warning(f"No se pudieron leer las relaciones material-proveedor: {exc}")
+        return pd.DataFrame()
+
+def fetch_latest_prices():
+    try:
+        return pd.DataFrame(supabase.rpc("ultimos_precios_materiales").execute().data or [])
+    except Exception:
+        return pd.DataFrame()
+
+def material_search_catalog(search_text="", category=None, brand=None):
+    rel = fetch_material_supplier()
+    latest = fetch_latest_prices()
+    if rel.empty:
+        return pd.DataFrame()
+    out = rel.copy()
+    if not latest.empty:
+        latest = latest.rename(columns={
+            "precio":"Último precio","moneda":"Moneda","fecha":"Actualizado","fuente":"Fuente precio"
+        })
+        keep = [c for c in ["material_id","proveedor_id","Último precio","Moneda","Actualizado","Fuente precio"] if c in latest.columns]
+        out = out.merge(latest[keep], on=["material_id","proveedor_id"], how="left")
+
+    if search_text.strip():
+        terms = [t.strip().lower() for t in search_text.split() if t.strip()]
+        searchable = (
+            out["Material"].fillna("").astype(str) + " " +
+            out["Marca"].fillna("").astype(str) + " " +
+            out["Modelo"].fillna("").astype(str) + " " +
+            out["Categoría"].fillna("").astype(str) + " " +
+            out["Proveedor"].fillna("").astype(str) + " " +
+            out["Código proveedor"].fillna("").astype(str)
+        ).str.lower()
+        mask = pd.Series(True, index=out.index)
+        for term in terms:
+            mask &= searchable.str.contains(re.escape(term), na=False)
+        out = out[mask]
+
+    if category:
+        out = out[out["Categoría"].astype(str).eq(category)]
+    if brand:
+        out = out[out["Marca"].astype(str).str.contains(brand, case=False, na=False)]
+    return out.sort_values(["Prioridad","Material","Proveedor"], na_position="last")
+
+def upsert_supplier(name, ruc="", contacto="", telefono="", correo="", observacion=""):
+    return supabase.table("proveedores").upsert({
+        "nombre": name.strip(), "ruc": ruc.strip() or None,
+        "contacto": contacto.strip() or None, "telefono": telefono.strip() or None,
+        "correo": correo.strip() or None, "observacion": observacion.strip() or None,
+        "activo": True
+    }, on_conflict="nombre").execute()
+
+def insert_material(name, category, brand="", model="", description=""):
+    return supabase.table("materiales").insert({
+        "nombre": name.strip(), "categoria": category,
+        "marca": brand.strip() or None, "modelo": model.strip() or None,
+        "descripcion": description.strip() or None, "activo": True
+    }).execute()
+
+def add_material_supplier(material_id, supplier_id, priority=3, supplier_code="", lead_time=None, note=""):
+    return supabase.table("material_proveedor").upsert({
+        "material_id": material_id, "proveedor_id": supplier_id,
+        "prioridad": int(priority), "codigo_proveedor": supplier_code.strip() or None,
+        "plazo_dias": int(lead_time) if lead_time is not None else None,
+        "observacion": note.strip() or None, "activo": True
+    }, on_conflict="material_id,proveedor_id").execute()
+
+def add_price(material_id, supplier_id, price, currency="PYG", date_value=None, source="Carga manual", note=""):
+    return supabase.table("historial_precios").insert({
+        "material_id": material_id, "proveedor_id": supplier_id,
+        "precio": float(price), "moneda": currency,
+        "fecha": (date_value or date.today()).isoformat(),
+        "fuente": source, "observacion": note.strip() or None,
+        "registrado_por": getattr(st.session_state.auth_user, "email", "") or ""
+    }).execute()
+
 # ============================================================
 # SIDEBAR
 # ============================================================
@@ -908,7 +1137,7 @@ with st.sidebar:
             "📦 Productos",
             "🏷️ Stock",
             "🔎 Compras / OCR",
-            "🏭 Proveedores",
+            "🏭 Proveedores / Materiales",
             "💵 Caja",
             "💳 Cuentas",
             "📊 Reportes",
@@ -1241,9 +1470,44 @@ elif page == "📄 Presupuestos":
             show = quotes_df.copy()
             cols = [c for c in ["numero","fecha","cliente_nombre","tipo","estado","total","creado_por"] if c in show.columns]
             show = show[cols].rename(columns={"numero":"N°","fecha":"Fecha","cliente_nombre":"Cliente","tipo":"Tipo","estado":"Estado","total":"Total","creado_por":"Responsable"})
-            if "Total" in show:
-                show["Total"] = show["Total"].apply(pyg)
-            st.dataframe(show, hide_index=True, use_container_width=True)
+
+            # Vista escritorio: tabla completa
+            st.markdown('<div class="desktop-only">', unsafe_allow_html=True)
+            desktop_show = show.copy()
+            if "Total" in desktop_show:
+                desktop_show["Total"] = desktop_show["Total"].apply(pyg)
+            st.dataframe(desktop_show, hide_index=True, use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            # Vista móvil: tarjetas
+            st.markdown('<div class="mobile-only">', unsafe_allow_html=True)
+            for i, row in show.iterrows():
+                numero = str(row.get("N°",""))
+                fecha = str(row.get("Fecha",""))
+                cliente = str(row.get("Cliente",""))
+                tipo = str(row.get("Tipo",""))
+                estado = str(row.get("Estado",""))
+                total = pyg(row.get("Total",0))
+                st.markdown(
+                    f"""
+                    <div class="quote-mobile-card">
+                        <div class="quote-mobile-top">
+                            <div>
+                                <div class="quote-mobile-number">{numero}</div>
+                                <div class="quote-mobile-client">{cliente}</div>
+                            </div>
+                            <span class="quote-mobile-badge">{estado}</span>
+                        </div>
+                        <div class="quote-mobile-meta">{fecha} · {tipo}</div>
+                        <div class="quote-mobile-total">{total}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+                if st.button("Ver presupuesto", key=f"mobile_view_quote_{i}", use_container_width=True):
+                    st.session_state.mobile_selected_quote = numero
+                    st.info("Abrí la pestaña **Vista previa / PDF** para ver o descargar este presupuesto.")
+            st.markdown('</div>', unsafe_allow_html=True)
 
     with tab_new:
         if clients_db.empty:
@@ -1375,7 +1639,15 @@ elif page == "📄 Presupuestos":
             st.info("Todavía no hay presupuestos para generar PDF.")
         else:
             label_map={f"{r['numero']} · {r['cliente_nombre']}":r["id"] for _,r in quotes_df.iterrows()}
-            chosen=st.selectbox("Seleccionar presupuesto",list(label_map.keys()),key="pdf_quote")
+            labels = list(label_map.keys())
+            default_index = 0
+            selected_num = st.session_state.get("mobile_selected_quote")
+            if selected_num:
+                for idx, label in enumerate(labels):
+                    if label.startswith(str(selected_num)):
+                        default_index = idx
+                        break
+            chosen=st.selectbox("Seleccionar presupuesto",labels,index=default_index,key="pdf_quote")
             quote_id=label_map[chosen]
             qrow=quotes_df[quotes_df["id"].eq(quote_id)].iloc[0].to_dict()
             items=fetch_quote_items(quote_id)
@@ -1461,11 +1733,142 @@ elif page == "🔎 Compras / OCR":
 
 
 # ============================================================
-# PROVEEDORES
+# PROVEEDORES / MATERIALES
 # ============================================================
-elif page == "🏭 Proveedores":
-    page_header("Proveedores", "Ficha, contactos, compras y condiciones comerciales")
-    st.info("Se implementará junto con Compras / OCR.")
+elif page == "🏭 Proveedores / Materiales":
+    page_header("Proveedores / Materiales", "Matriz de compra, marcas y último precio")
+
+    suppliers = fetch_suppliers()
+    materials = fetch_materials()
+
+    tab_search, tab_suppliers, tab_materials, tab_link, tab_price = st.tabs([
+        "🔎 Buscador", "🏭 Proveedores", "📦 Materiales", "🔗 Relacionar", "💲 Precios"
+    ])
+
+    with tab_search:
+        q = st.text_input(
+            "Buscar",
+            placeholder="Ej.: contactor, lovato, bf26, ccp, relé 220v...",
+            key="mat_search"
+        )
+        f1, f2 = st.columns(2)
+        cats = sorted([x for x in materials.get("categoria", pd.Series(dtype=str)).dropna().astype(str).unique() if x]) if not materials.empty else []
+        cat = f1.selectbox("Categoría", ["Todas"] + cats)
+        brand = f2.text_input("Marca (opcional)")
+        result = material_search_catalog(q, None if cat == "Todas" else cat, brand.strip() or None)
+
+        if result.empty:
+            st.info("No encontré coincidencias.")
+        else:
+            view = result.copy()
+            if "Último precio" in view.columns:
+                view["Último precio"] = view["Último precio"].apply(
+                    lambda x: "Sin precio" if pd.isna(x) else pyg(x)
+                )
+            if "Actualizado" in view.columns:
+                dates = pd.to_datetime(view["Actualizado"], errors="coerce")
+                days = (pd.Timestamp(date.today()) - dates).dt.days
+                view["Hace"] = days.apply(
+                    lambda d: "" if pd.isna(d) else ("Hoy" if d == 0 else f"Hace {int(d)} día(s)")
+                )
+            cols = [c for c in [
+                "Material","Marca","Modelo","Categoría","Proveedor","Prioridad",
+                "Último precio","Actualizado","Hace","Plazo días","Código proveedor"
+            ] if c in view.columns]
+            st.dataframe(view[cols], hide_index=True, use_container_width=True)
+
+    with tab_suppliers:
+        if not suppliers.empty:
+            cols = [c for c in ["nombre","contacto","telefono","correo","ruc","observacion"] if c in suppliers.columns]
+            st.dataframe(suppliers[cols], hide_index=True, use_container_width=True)
+        with st.expander("➕ Nuevo proveedor"):
+            name = st.text_input("Nombre *", key="sup_name")
+            ruc = st.text_input("RUC", key="sup_ruc")
+            contact = st.text_input("Contacto", key="sup_contact")
+            phone = st.text_input("Teléfono", key="sup_phone")
+            email = st.text_input("Correo", key="sup_email")
+            note = st.text_area("Observación", key="sup_note")
+            if st.button("Guardar proveedor", type="primary", use_container_width=True):
+                if not name.strip():
+                    st.warning("Ingresá el nombre.")
+                else:
+                    try:
+                        upsert_supplier(name, ruc, contact, phone, email, note)
+                        st.success("Proveedor guardado.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error("No se pudo guardar el proveedor.")
+                        st.caption(str(exc))
+
+    with tab_materials:
+        if not materials.empty:
+            cols = [c for c in ["nombre","categoria","marca","modelo","descripcion"] if c in materials.columns]
+            st.dataframe(materials[cols], hide_index=True, use_container_width=True)
+        with st.expander("➕ Nuevo material"):
+            name = st.text_input("Material *", placeholder="Ej.: Contactor", key="mat_name")
+            cat = st.selectbox("Categoría", MATERIAL_CATEGORIES, key="mat_cat")
+            brand = st.text_input("Marca", placeholder="Ej.: LOVATO", key="mat_brand")
+            model = st.text_input("Modelo / referencia", placeholder="Ej.: BF26", key="mat_model")
+            desc = st.text_area("Descripción", key="mat_desc")
+            if st.button("Guardar material", type="primary", use_container_width=True):
+                if not name.strip():
+                    st.warning("Ingresá el material.")
+                else:
+                    try:
+                        insert_material(name, cat, brand, model, desc)
+                        st.success("Material guardado.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error("No se pudo guardar el material.")
+                        st.caption(str(exc))
+
+    with tab_link:
+        if suppliers.empty or materials.empty:
+            st.info("Primero cargá al menos un proveedor y un material.")
+        else:
+            mat_labels = {f"{r.get('nombre','')} · {r.get('marca','') or ''} · {r.get('modelo','') or ''}": r["id"] for _, r in materials.iterrows()}
+            sup_labels = {r["nombre"]: r["id"] for _, r in suppliers.iterrows()}
+            material_label = st.selectbox("Material", list(mat_labels.keys()), key="link_mat")
+            supplier_label = st.selectbox("Proveedor", list(sup_labels.keys()), key="link_sup")
+            c1,c2 = st.columns(2)
+            priority = c1.number_input("Prioridad", min_value=1, max_value=9, value=1, step=1)
+            lead = c2.number_input("Plazo habitual (días)", min_value=0, value=0, step=1)
+            supplier_code = st.text_input("Código del proveedor")
+            note = st.text_area("Observación", placeholder="Ej.: proveedor preferido para LOVATO")
+            if st.button("Guardar relación", type="primary", use_container_width=True):
+                try:
+                    add_material_supplier(mat_labels[material_label], sup_labels[supplier_label], priority, supplier_code, lead, note)
+                    st.success("Relación material-proveedor guardada.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error("No se pudo guardar la relación.")
+                    st.caption(str(exc))
+
+    with tab_price:
+        if suppliers.empty or materials.empty:
+            st.info("Primero cargá proveedores y materiales.")
+        else:
+            mat_labels = {f"{r.get('nombre','')} · {r.get('marca','') or ''} · {r.get('modelo','') or ''}": r["id"] for _, r in materials.iterrows()}
+            sup_labels = {r["nombre"]: r["id"] for _, r in suppliers.iterrows()}
+            material_label = st.selectbox("Material", list(mat_labels.keys()), key="price_mat")
+            supplier_label = st.selectbox("Proveedor", list(sup_labels.keys()), key="price_sup")
+            c1,c2,c3 = st.columns(3)
+            price = c1.number_input("Precio", min_value=0.0, step=1000.0, format="%.0f")
+            currency = c2.selectbox("Moneda", ["PYG","USD"])
+            pdate = c3.date_input("Fecha", date.today())
+            source = st.selectbox("Origen", ["Carga manual","Cotización","OCR","Compra"])
+            note = st.text_area("Observación")
+            if st.button("Registrar precio", type="primary", use_container_width=True):
+                if price <= 0:
+                    st.warning("Ingresá un precio mayor a cero.")
+                else:
+                    try:
+                        add_price(mat_labels[material_label], sup_labels[supplier_label], price, currency, pdate, source, note)
+                        st.success("Precio agregado al historial.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error("No se pudo registrar el precio.")
+                        st.caption(str(exc))
 
 
 # ============================================================
@@ -1638,6 +2041,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.4 Presupuestos</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.5 Materiales</div>',
     unsafe_allow_html=True,
 )
