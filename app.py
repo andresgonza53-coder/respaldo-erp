@@ -16,7 +16,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.3 - Supabase"
+APP_VERSION = "3.3.1 - Supabase"
 
 
 # ============================================================
@@ -146,7 +146,20 @@ def get_supabase():
     try:
         url = st.secrets["SUPABASE_URL"]
         key = st.secrets["SUPABASE_KEY"]
-        return create_client(url, key)
+        client = create_client(url, key)
+
+        # Streamlit reconstruye el script en cada interacción.
+        # Restauramos la sesión autenticada para que las consultas usen
+        # el rol "authenticated" y no vuelvan a ejecutarse como "anon".
+        if "auth_access_token" in st.session_state and "auth_refresh_token" in st.session_state:
+            access_token = st.session_state.get("auth_access_token")
+            refresh_token = st.session_state.get("auth_refresh_token")
+            if access_token and refresh_token:
+                try:
+                    client.auth.set_session(access_token, refresh_token)
+                except Exception:
+                    pass
+        return client
     except Exception as exc:
         st.error("No se pudo inicializar Supabase. Revisá los Secrets de Streamlit.")
         st.exception(exc)
@@ -159,8 +172,21 @@ def ensure_login():
         st.session_state.auth_user = None
     if "auth_session" not in st.session_state:
         st.session_state.auth_session = None
+    if "auth_access_token" not in st.session_state:
+        st.session_state.auth_access_token = None
+    if "auth_refresh_token" not in st.session_state:
+        st.session_state.auth_refresh_token = None
 
     if st.session_state.auth_user is not None:
+        # Reaplica la sesión al cliente actual después de cada rerun.
+        if st.session_state.auth_access_token and st.session_state.auth_refresh_token:
+            try:
+                supabase.auth.set_session(
+                    st.session_state.auth_access_token,
+                    st.session_state.auth_refresh_token
+                )
+            except Exception:
+                pass
         return
 
     st.markdown("## 🔐 Acceso al ERP")
@@ -176,6 +202,8 @@ def ensure_login():
             })
             st.session_state.auth_user = res.user
             st.session_state.auth_session = res.session
+            st.session_state.auth_access_token = res.session.access_token
+            st.session_state.auth_refresh_token = res.session.refresh_token
             st.success("Acceso correcto.")
             st.rerun()
         except Exception as exc:
@@ -192,6 +220,8 @@ def logout():
         pass
     st.session_state.auth_user = None
     st.session_state.auth_session = None
+    st.session_state.auth_access_token = None
+    st.session_state.auth_refresh_token = None
     st.rerun()
 
 def fetch_crm_from_db():
@@ -1255,6 +1285,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.3 Supabase</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.3.1 Supabase</div>',
     unsafe_allow_html=True,
 )
