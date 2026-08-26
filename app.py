@@ -28,7 +28,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.8.1 - Duplicados PDF"
+APP_VERSION = "3.9 - Historial inteligente de precios"
 
 
 st.markdown("""
@@ -1126,6 +1126,34 @@ def add_price(material_id, supplier_id, price, currency="PYG", date_value=None, 
     }).execute()
 
 
+def fetch_price_history(material_id=None, supplier_id=None):
+    """Historial de precios con nombres de material/proveedor, sin depender de una vista SQL adicional."""
+    try:
+        query = supabase.table("historial_precios").select("*")
+        if material_id:
+            query = query.eq("material_id", material_id)
+        if supplier_id:
+            query = query.eq("proveedor_id", supplier_id)
+        hist = pd.DataFrame(query.order("fecha", desc=True).execute().data or [])
+        if hist.empty:
+            return hist
+
+        mats = fetch_materials()
+        sups = fetch_suppliers()
+        if not mats.empty:
+            mm = mats[[c for c in ["id","nombre","marca","modelo"] if c in mats.columns]].copy()
+            mm = mm.rename(columns={"id":"material_id","nombre":"Material","marca":"Marca","modelo":"Modelo"})
+            hist = hist.merge(mm, on="material_id", how="left")
+        if not sups.empty:
+            ss = sups[[c for c in ["id","nombre"] if c in sups.columns]].copy()
+            ss = ss.rename(columns={"id":"proveedor_id","nombre":"Proveedor"})
+            hist = hist.merge(ss, on="proveedor_id", how="left")
+        return hist
+    except Exception as exc:
+        st.warning(f"No se pudo leer el historial de precios: {exc}")
+        return pd.DataFrame()
+
+
 # ============================================================
 # COMPRAS / OCR V3.7 - PDF INTELIGENTE + NORMALIZACIÓN DE MATERIALES
 # ============================================================
@@ -1747,7 +1775,7 @@ def save_purchase_document(meta, items_df, supplier_id, auto_create_materials=Tr
             except Exception:
                 pass
             if price > 0:
-                add_price(material_id, supplier_id, price, meta.get("moneda") or "PYG", meta.get("fecha") or date.today(), "Factura" if dtype=="Factura" else "Cotización", f"Documento {number}")
+                add_price(material_id, supplier_id, price, meta.get("moneda") or "PYG", meta.get("fecha") or date.today(), "Factura" if dtype=="Factura" else "Cotización", f"Documento {number} · Cantidad {qty:g} · Subtotal {subtotal or (qty*price):.0f}")
     if rows:
         supabase.table("documentos_compra_items").insert(rows).execute()
     return doc_id, len(rows)
@@ -2495,8 +2523,8 @@ elif page == "🏭 Proveedores / Materiales":
     suppliers = fetch_suppliers()
     materials = fetch_materials()
 
-    tab_search, tab_suppliers, tab_materials, tab_link, tab_price = st.tabs([
-        "🔎 Buscador", "🏭 Proveedores", "📦 Materiales", "🔗 Relacionar", "💲 Precios"
+    tab_search, tab_suppliers, tab_materials, tab_link, tab_price, tab_history = st.tabs([
+        "🔎 Buscador", "🏭 Proveedores", "📦 Materiales", "🔗 Relacionar", "💲 Precios", "📈 Historial"
     ])
 
     with tab_search:
@@ -2646,6 +2674,56 @@ elif page == "🏭 Proveedores / Materiales":
                     except Exception as exc:
                         st.error("No se pudo registrar el precio.")
                         st.caption(str(exc))
+
+
+    with tab_history:
+        st.markdown("### Historial inteligente de precios")
+        st.caption("Cada PDF confirmado agrega una nueva referencia de precio al material existente. Un documento duplicado se bloquea antes de volver a registrar precios.")
+        history = fetch_price_history()
+        if history.empty:
+            st.info("Todavía no hay precios registrados en el historial.")
+        else:
+            labels = {}
+            for _, r in materials.iterrows():
+                label = " · ".join([x for x in [str(r.get("nombre","") or ""), str(r.get("marca","") or ""), str(r.get("modelo","") or "")] if x])
+                labels[label] = r.get("id")
+            options = ["Todos los materiales"] + sorted(labels.keys())
+            selected = st.selectbox("Material", options, key="history_material")
+            filtered = history.copy() if selected == "Todos los materiales" else history[history["material_id"].eq(labels[selected])].copy()
+
+            if not filtered.empty:
+                filtered["fecha_dt"] = pd.to_datetime(filtered.get("fecha"), errors="coerce")
+                filtered["precio_num"] = pd.to_numeric(filtered.get("precio"), errors="coerce")
+                if selected != "Todos los materiales":
+                    valid = filtered.dropna(subset=["precio_num"]).sort_values("fecha_dt", ascending=False)
+                    if not valid.empty:
+                        last = valid.iloc[0]
+                        previous = valid.iloc[1] if len(valid) > 1 else None
+                        same_currency = valid[valid.get("moneda", pd.Series(index=valid.index, dtype=str)).astype(str).eq(str(last.get("moneda","")))]
+                        best = same_currency.loc[same_currency["precio_num"].idxmin()] if not same_currency.empty else last
+                        c1,c2,c3,c4 = st.columns(4)
+                        c1.metric("Último precio", f"{last.get('moneda','PYG')} {float(last['precio_num']):,.0f}")
+                        if previous is not None and float(previous["precio_num"] or 0) != 0:
+                            variation = (float(last["precio_num"]) / float(previous["precio_num"]) - 1) * 100
+                            c2.metric("Variación vs. anterior", f"{variation:+.1f}%")
+                        else:
+                            c2.metric("Variación vs. anterior", "—")
+                        c3.metric("Mejor precio registrado", f"{best.get('moneda','PYG')} {float(best['precio_num']):,.0f}")
+                        c4.metric("Proveedor mejor precio", str(best.get("Proveedor","") or "—"))
+
+                view = filtered.copy()
+                if "precio" in view.columns:
+                    view["Precio"] = view.apply(lambda r: f"{r.get('moneda','PYG')} {float(r.get('precio',0) or 0):,.0f}", axis=1)
+                view = view.sort_values("fecha_dt", ascending=False)
+                cols = [c for c in ["fecha","Material","Marca","Modelo","Proveedor","Precio","fuente","observacion","registrado_por"] if c in view.columns]
+                st.dataframe(view[cols], hide_index=True, use_container_width=True)
+
+                if selected != "Todos los materiales":
+                    st.markdown("#### Comparación por proveedor")
+                    comp = filtered.dropna(subset=["precio_num"]).sort_values("fecha_dt", ascending=False).drop_duplicates(subset=["proveedor_id","moneda"], keep="first")
+                    comp_cols = [c for c in ["Proveedor","moneda","precio_num","fecha","fuente"] if c in comp.columns]
+                    comp = comp[comp_cols].rename(columns={"moneda":"Moneda","precio_num":"Último precio","fecha":"Fecha","fuente":"Origen"})
+                    st.dataframe(comp, hide_index=True, use_container_width=True)
 
 
 # ============================================================
@@ -2818,6 +2896,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.8.1 Duplicados PDF</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9 Historial inteligente de precios</div>',
     unsafe_allow_html=True,
 )
