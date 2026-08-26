@@ -28,7 +28,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.8 - Duplicados inteligentes"
+APP_VERSION = "3.8.1 - Duplicados PDF"
 
 
 st.markdown("""
@@ -1354,6 +1354,27 @@ def suggest_material_name(description, brand="", model=""):
     return clean[:90].title()
 
 
+
+def material_identity_key(name="", brand="", model=""):
+    """Clave estable para detectar el mismo material dentro de un PDF/importación.
+
+    Prioridad:
+    1) Marca + Modelo/Referencia
+    2) Nombre + Marca
+    3) Nombre
+    """
+    nn = normalize_text(name)
+    nb = normalize_text(brand)
+    nm = normalize_text(model)
+    if nb and nm:
+        return f"BM::{nb}::{nm}"
+    if nn and nb:
+        return f"NB::{nn}::{nb}"
+    if nn:
+        return f"N::{nn}"
+    return ""
+
+
 def classify_material_match(name="", brand="", model="", mats=None):
     """Clasifica la coincidencia del catálogo priorizando Marca + Modelo/Referencia.
 
@@ -1406,46 +1427,74 @@ def classify_material_match(name="", brand="", model="", mats=None):
 
 
 def enrich_items_for_catalog(items_df):
-    """Agrega Material, Estado catálogo, Coincidencia y Acción a los ítems del PDF."""
+    """V3.8.1: agrega estado de catálogo y detecta repetidos dentro del mismo PDF."""
     if items_df is None or items_df.empty:
         return items_df
+
     out = items_df.copy()
     if "modelo" not in out.columns:
         out["modelo"] = ""
 
     mats = fetch_materials()
     materials, statuses, matches, actions = [], [], [], []
+    seen_pdf = {}
 
-    for _, row in out.iterrows():
+    for pos, (idx, row) in enumerate(out.iterrows(), start=1):
         desc = str(row.get("descripcion", "") or "").strip()
         brand = str(row.get("marca", "") or "").strip()
         model = str(row.get("modelo", "") or "").strip()
+
         if not model:
             model = infer_model_reference(desc, row.get("codigo_proveedor", ""))
+
         material_name = suggest_material_name(desc, brand, model)
-        status, match = classify_material_match(material_name, brand, model, mats)
+        pdf_key = material_identity_key(material_name, brand, model)
+
+        # Primero detectamos repetidos dentro del mismo documento.
+        if pdf_key and pdf_key in seen_pdf:
+            first = seen_pdf[pdf_key]
+            status = "🟣 MISMO PDF — reutilizar"
+            match = None
+            match_label = (
+                f"Fila {first['fila']} | {first['material']}"
+                + (f" | {first['marca']}" if first["marca"] else "")
+                + (f" | {first['modelo']}" if first["modelo"] else "")
+            )
+            action = "Automático"
+        else:
+            status, match = classify_material_match(material_name, brand, model, mats)
+
+            if match:
+                match_label = " | ".join([x for x in [
+                    str(match.get("nombre", "") or "").strip(),
+                    str(match.get("marca", "") or "").strip(),
+                    str(match.get("modelo", "") or "").strip(),
+                ] if x])
+            else:
+                match_label = ""
+
+            if status.startswith("🟢"):
+                action = "Usar existente"
+            elif status.startswith("🔵"):
+                action = "Crear nuevo"
+            else:
+                action = "Automático"
+
+            if pdf_key:
+                seen_pdf[pdf_key] = {
+                    "fila": pos,
+                    "material": material_name,
+                    "marca": brand,
+                    "modelo": model,
+                }
 
         materials.append(material_name)
         statuses.append(status)
-        if match:
-            match_label = " | ".join([x for x in [
-                str(match.get("nombre", "") or "").strip(),
-                str(match.get("marca", "") or "").strip(),
-                str(match.get("modelo", "") or "").strip(),
-            ] if x])
-        else:
-            match_label = ""
         matches.append(match_label)
-
-        if status.startswith("🟢"):
-            actions.append("Usar existente")
-        elif status.startswith("🔵"):
-            actions.append("Crear nuevo")
-        else:
-            actions.append("Automático")
+        actions.append(action)
 
         if model:
-            out.at[row.name, "modelo"] = model
+            out.at[idx, "modelo"] = model
 
     out.insert(2, "material", materials)
     out.insert(3, "estado_catalogo", statuses)
@@ -1642,6 +1691,10 @@ def save_purchase_document(meta, items_df, supplier_id, auto_create_materials=Tr
     doc_id=(res.data or [{}])[0].get("id")
     if not doc_id: raise RuntimeError("No se obtuvo el ID del documento guardado.")
     rows=[]
+    # V3.8.1: cache local para que líneas repetidas del mismo PDF
+    # reutilicen el mismo material recién encontrado/creado.
+    material_cache = {}
+
     for idx,r in items_df.iterrows():
         confirmed=bool(r.get("confirmado",True))
         desc=str(r.get("descripcion","") or "").strip()
@@ -1649,12 +1702,38 @@ def save_purchase_document(meta, items_df, supplier_id, auto_create_materials=Tr
         material_id=None
         if auto_create_materials:
             action=str(r.get("accion","Automático") or "Automático").strip()
-            if action == "Usar existente":
-                material_id=create_material_from_item(r, require_existing=True)
-            elif action == "Crear nuevo":
-                material_id=create_material_from_item(r, force_new=True)
+
+            desc_for_key = str(r.get("descripcion","") or "").strip()
+            brand_for_key = str(r.get("marca","") or "").strip()
+            model_for_key = str(r.get("modelo","") or "").strip() or infer_model_reference(
+                desc_for_key, r.get("codigo_proveedor", "")
+            )
+            material_name_for_key = str(r.get("material","") or "").strip() or suggest_material_name(
+                desc_for_key, brand_for_key, model_for_key
+            )
+            cache_key = material_identity_key(
+                material_name_for_key, brand_for_key, model_for_key
+            )
+
+            # Si ya procesamos el mismo material dentro de este PDF, lo reutilizamos.
+            # "Crear nuevo" sigue permitiendo forzar un alta separada si el usuario lo decide.
+            if action != "Crear nuevo" and cache_key and cache_key in material_cache:
+                material_id = material_cache[cache_key]
             else:
-                material_id=create_material_from_item(r)
+                if action == "Usar existente":
+                    material_id=create_material_from_item(r, require_existing=True)
+                elif action == "Crear nuevo":
+                    # Si el mismo ítem aparece repetido en el PDF y ambos quedaron
+                    # automáticamente como "Crear nuevo", el segundo reutiliza el primero.
+                    if cache_key and cache_key in material_cache:
+                        material_id = material_cache[cache_key]
+                    else:
+                        material_id=create_material_from_item(r, force_new=True)
+                else:
+                    material_id=create_material_from_item(r)
+
+                if material_id and cache_key:
+                    material_cache[cache_key] = material_id
         qty=float(r.get("cantidad",0) or 0); price=float(r.get("precio_unitario",0) or 0); subtotal=float(r.get("subtotal",0) or 0)
         rows.append({
             "documento_id":doc_id,"orden":int(r.get("orden",idx+1) or idx+1),"codigo_proveedor":str(r.get("codigo_proveedor","") or "").strip() or None,
@@ -2343,7 +2422,7 @@ elif page == "🔎 Compras / OCR":
 
                     parsed_items = enrich_items_for_catalog(parsed_items)
                     st.markdown("#### Validar ítems")
-                    st.caption("V3.8 prioriza Marca + Modelo/Referencia: 🟢 existente se reutiliza; 🟡 posible coincidencia requiere revisión; 🔵 nuevo se crea. La Acción sigue siendo editable antes de guardar.")
+                    st.caption("V3.8.1: 🟢 existente se reutiliza; 🟡 posible coincidencia requiere revisión; 🔵 nuevo se crea; 🟣 mismo PDF reutiliza el material de la primera fila. La Acción sigue siendo editable antes de guardar.")
                     edited=st.data_editor(
                         parsed_items,
                         hide_index=True,
@@ -2371,7 +2450,7 @@ elif page == "🔎 Compras / OCR":
                         "Crear/vincular materiales automáticamente y actualizar historial de precios",
                         value=True,
                         key=f"auto_{digest}",
-                        help="V3.8 reutiliza automáticamente solo coincidencias de alta confianza. Las posibles coincidencias quedan visibles para revisión y siempre se conserva la descripción original del proveedor."
+                        help="V3.8.1 reutiliza coincidencias de alta confianza y también repetidos dentro del mismo PDF. Siempre se conserva la descripción original del proveedor."
                     )
 
                     if st.button("✅ Confirmar importación", type="primary", use_container_width=True, key=f"save_{digest}"):
@@ -2739,6 +2818,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.7 PDF inteligente</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.8.1 Duplicados PDF</div>',
     unsafe_allow_html=True,
 )
