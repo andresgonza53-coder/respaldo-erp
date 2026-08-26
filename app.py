@@ -28,7 +28,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.9.1 - Comparador de precios PDF"
+APP_VERSION = "3.9.2 - Comparador visual de compras"
 
 
 st.markdown("""
@@ -1553,6 +1553,7 @@ def enrich_items_for_catalog(items_df, supplier_id=None, currency="PYG"):
     materials, statuses, matches, actions = [], [], [], []
     last_prices, last_dates, variations = [], [], []
     best_prices, best_suppliers, indicators = [], [], []
+    diff_last_values, diff_best_values, best_diff_pct_values, recommendations = [], [], [], []
     seen_pdf = {}
 
     def mat_row_by_id(mid):
@@ -1691,6 +1692,33 @@ def enrich_items_for_catalog(items_df, supplier_id=None, currency="PYG"):
 
         lp, ld, var, bp, bs, ind = price_info(matched_material_id, current_price)
 
+        # Comparaciones absolutas para compras.
+        diff_last = ""
+        diff_best = ""
+        best_diff_pct = ""
+        recommendation = "⚪ Sin historial"
+
+        try:
+            if lp not in ("", None) and float(lp) > 0 and current_price > 0:
+                diff_last = float(current_price) - float(lp)
+        except Exception:
+            diff_last = ""
+
+        try:
+            if bp not in ("", None) and float(bp) > 0 and current_price > 0:
+                diff_best = float(current_price) - float(bp)
+                best_diff_pct = (float(current_price) / float(bp) - 1.0) * 100.0
+
+                if best_diff_pct <= 0.5:
+                    recommendation = "🟢 Precio competitivo"
+                elif best_diff_pct <= 5:
+                    recommendation = "🟡 Cerca del mejor"
+                else:
+                    recommendation = "🔴 Revisar otro proveedor"
+        except Exception:
+            diff_best = ""
+            best_diff_pct = ""
+
         materials.append(material_name)
         statuses.append(status)
         matches.append(match_label)
@@ -1701,6 +1729,10 @@ def enrich_items_for_catalog(items_df, supplier_id=None, currency="PYG"):
         best_prices.append(bp)
         best_suppliers.append(bs)
         indicators.append(ind)
+        diff_last_values.append(diff_last)
+        diff_best_values.append(diff_best)
+        best_diff_pct_values.append(best_diff_pct)
+        recommendations.append(recommendation)
 
         if model:
             out.at[idx, "modelo"] = model
@@ -1717,8 +1749,39 @@ def enrich_items_for_catalog(items_df, supplier_id=None, currency="PYG"):
     out["mejor_precio"] = best_prices
     out["mejor_proveedor"] = best_suppliers
     out["tendencia_precio"] = indicators
+    out["diferencia_ultimo"] = diff_last_values
+    out["diferencia_mejor"] = diff_best_values
+    out["sobre_mejor_pct"] = best_diff_pct_values
+    out["recomendacion_compra"] = recommendations
 
     return out
+
+
+
+def purchase_comparison_summary(items_df):
+    """Resumen compacto para decidir antes de confirmar una compra/cotización."""
+    if items_df is None or items_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for _, r in items_df.iterrows():
+        current = float(r.get("precio_unitario", 0) or 0)
+        last = r.get("ultimo_precio", "")
+        best = r.get("mejor_precio", "")
+        rows.append({
+            "Material": clean_display_value(r.get("material")),
+            "Marca": clean_display_value(r.get("marca")),
+            "Modelo": clean_display_value(r.get("modelo")),
+            "Precio actual": current if current else None,
+            "Último precio": None if last in ("", None) else last,
+            "Variación %": None if r.get("variacion_pct", "") in ("", None) else r.get("variacion_pct"),
+            "Tendencia": clean_display_value(r.get("tendencia_precio")),
+            "Mejor precio": None if best in ("", None) else best,
+            "Mejor proveedor": clean_display_value(r.get("mejor_proveedor")),
+            "Vs mejor %": None if r.get("sobre_mejor_pct", "") in ("", None) else r.get("sobre_mejor_pct"),
+            "Recomendación": clean_display_value(r.get("recomendacion_compra")),
+        })
+    return pd.DataFrame(rows)
 
 
 def find_material_catalog(name="", brand="", model=""):
@@ -2593,7 +2656,7 @@ elif page == "🏷️ Stock":
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.9.1: identifica materiales, bloquea documentos repetidos y compara el precio del PDF contra el historial antes de guardar.")
+    st.success("V3.9.2: compara automáticamente cada precio del PDF contra el último precio y el mejor precio histórico antes de guardar.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -2655,7 +2718,36 @@ elif page == "🔎 Compras / OCR":
 
                     parsed_items = enrich_items_for_catalog(parsed_items, supplier_row_id_for_preview, currency)
                     st.markdown("#### Validar ítems")
-                    st.caption("V3.9.1: además del estado del catálogo, compará Precio actual vs Último precio, variación y mejor precio histórico. 🟢 bajó · 🟡 igual · 🔴 subió.")
+                    st.caption("V3.9.2: comparación visible antes de comprar. Precio actual vs último y mejor histórico, con recomendación automática.")
+                    comparison_df = purchase_comparison_summary(parsed_items)
+                    if not comparison_df.empty:
+                        st.markdown("##### 💰 Comparador de precios")
+                        st.dataframe(
+                            comparison_df,
+                            hide_index=True,
+                            use_container_width=True,
+                            column_config={
+                                "Precio actual": st.column_config.NumberColumn(format="Gs. %.0f"),
+                                "Último precio": st.column_config.NumberColumn(format="Gs. %.0f"),
+                                "Variación %": st.column_config.NumberColumn(format="%.1f%%"),
+                                "Mejor precio": st.column_config.NumberColumn(format="Gs. %.0f"),
+                                "Vs mejor %": st.column_config.NumberColumn(format="%.1f%%"),
+                            },
+                        )
+
+                    # Reordenamos las columnas del editor para que las comparaciones
+                    # queden cerca del precio actual y no ocultas al extremo derecho.
+                    preferred_order = [
+                        "orden","codigo_proveedor","material","estado_catalogo","coincidencia","accion",
+                        "descripcion","marca","modelo","cantidad","unidad","precio_unitario",
+                        "ultimo_precio","variacion_pct","tendencia_precio",
+                        "mejor_precio","mejor_proveedor","sobre_mejor_pct","recomendacion_compra",
+                        "subtotal","importar","fecha_ultimo_precio","diferencia_ultimo","diferencia_mejor"
+                    ]
+                    ordered_cols = [c for c in preferred_order if c in parsed_items.columns]
+                    ordered_cols += [c for c in parsed_items.columns if c not in ordered_cols]
+                    parsed_items = parsed_items[ordered_cols]
+
                     edited=st.data_editor(
                         parsed_items,
                         hide_index=True,
@@ -2674,6 +2766,10 @@ elif page == "🔎 Compras / OCR":
                             "mejor_precio": st.column_config.NumberColumn("Mejor precio", min_value=0.0, format="%.0f", disabled=True),
                             "mejor_proveedor": st.column_config.TextColumn("Mejor proveedor", disabled=True),
                             "tendencia_precio": st.column_config.TextColumn("Tendencia", disabled=True),
+                            "diferencia_ultimo": st.column_config.NumberColumn("Dif. vs último", format="%.0f", disabled=True),
+                            "diferencia_mejor": st.column_config.NumberColumn("Dif. vs mejor", format="%.0f", disabled=True),
+                            "sobre_mejor_pct": st.column_config.NumberColumn("Vs mejor %", format="%.1f%%", disabled=True),
+                            "recomendacion_compra": st.column_config.TextColumn("Recomendación", width="medium", disabled=True),
                             "accion": st.column_config.SelectboxColumn("Acción", options=["Automático","Usar existente","Crear nuevo"], required=True),
                             "descripcion": st.column_config.TextColumn("Descripción original", width="large"),
                             "marca": st.column_config.TextColumn("Marca"),
@@ -3125,6 +3221,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9.1 Comparador de precios PDF</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9.2 Comparador visual de compras</div>',
     unsafe_allow_html=True,
 )
