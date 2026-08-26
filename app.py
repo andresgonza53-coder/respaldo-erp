@@ -33,7 +33,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.9.3 - Lector PDF robusto"
+APP_VERSION = "3.9.4 - Lector PDF por coordenadas"
 
 
 st.markdown("""
@@ -1319,6 +1319,237 @@ def extract_pdf_text(uploaded_file):
     return candidates[0][1]
 
 
+
+def extract_pdf_words(uploaded_file):
+    """Devuelve palabras con coordenadas x/y por página usando PyMuPDF."""
+    if fitz is None:
+        return []
+    data = uploaded_file.getvalue()
+    out = []
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+        for pno, page in enumerate(doc):
+            words = page.get_text("words") or []
+            # x0,y0,x1,y1,text,block,line,word
+            for w in words:
+                if len(w) >= 5 and str(w[4]).strip():
+                    out.append({
+                        "page": pno + 1,
+                        "x0": float(w[0]), "y0": float(w[1]),
+                        "x1": float(w[2]), "y1": float(w[3]),
+                        "text": str(w[4]).strip(),
+                    })
+    except Exception:
+        return []
+    return out
+
+
+def group_words_into_rows(words, y_tolerance=3.2):
+    """Agrupa palabras por cercanía vertical y las ordena por X."""
+    if not words:
+        return []
+    by_page = {}
+    for w in words:
+        by_page.setdefault(w["page"], []).append(w)
+
+    rows = []
+    for page, page_words in by_page.items():
+        page_words = sorted(page_words, key=lambda w: (w["y0"], w["x0"]))
+        current = []
+        current_y = None
+        for w in page_words:
+            if current_y is None or abs(w["y0"] - current_y) <= y_tolerance:
+                current.append(w)
+                if current_y is None:
+                    current_y = w["y0"]
+                else:
+                    current_y = (current_y * (len(current)-1) + w["y0"]) / len(current)
+            else:
+                current = sorted(current, key=lambda z: z["x0"])
+                rows.append({"page": page, "y": current_y, "words": current})
+                current = [w]
+                current_y = w["y0"]
+        if current:
+            current = sorted(current, key=lambda z: z["x0"])
+            rows.append({"page": page, "y": current_y, "words": current})
+    return rows
+
+
+def row_text(row):
+    return " ".join(w["text"] for w in row.get("words", []))
+
+
+def detect_table_columns_from_headers(rows):
+    """Detecta posiciones X de columnas típicas a partir del encabezado visual."""
+    header_terms = {
+        "codigo": ["CODIGO", "CÓDIGO", "ITEM", "COD."],
+        "descripcion": ["DESCRIPCION", "DESCRIPCIÓN", "DETALLE", "PRODUCTO", "ARTICULO", "ARTÍCULO"],
+        "cantidad": ["CANTIDAD", "CANT.", "CANT"],
+        "unidad": ["UNIDAD", "UNID", "U.M.", "UM"],
+        "precio": ["PRECIO UNITARIO", "P. UNIT", "PRECIO", "UNITARIO"],
+        "subtotal": ["SUBTOTAL", "TOTAL", "IMPORTE"],
+    }
+    detected = {}
+    for row in rows:
+        txt = normalize_text(row_text(row))
+        if not txt:
+            continue
+        hits = 0
+        row_positions = {}
+        for key, terms in header_terms.items():
+            for w in row["words"]:
+                wt = normalize_text(w["text"])
+                if any(normalize_text(t) in wt or wt in normalize_text(t) for t in terms):
+                    row_positions[key] = w["x0"]
+                    hits += 1
+                    break
+        if hits >= 2:
+            detected.update(row_positions)
+            # Si logramos suficientes columnas, nos quedamos con ese header.
+            if len(detected) >= 4:
+                return detected
+    return detected
+
+
+def nearest_col_key(x, cols):
+    if not cols:
+        return None
+    return min(cols, key=lambda k: abs(x - cols[k]))
+
+
+def parse_items_by_coordinates(uploaded_file):
+    """Reconstruye filas de factura/presupuesto usando coordenadas X/Y.
+
+    Estrategia:
+    1) detectar encabezados y posiciones de columnas;
+    2) agrupar palabras por fila visual;
+    3) clasificar tokens por X;
+    4) validar cantidad/precio/subtotal.
+    """
+    words = extract_pdf_words(uploaded_file)
+    rows = group_words_into_rows(words)
+    if not rows:
+        return []
+
+    cols = detect_table_columns_from_headers(rows)
+    results = []
+    order_auto = 1
+
+    # Fallback geométrico si no hallamos header suficiente:
+    if len(cols) < 3:
+        xs = sorted(w["x0"] for w in words)
+        if xs:
+            xmin, xmax = xs[0], xs[-1]
+            span = max(xmax - xmin, 1)
+            cols = {
+                "descripcion": xmin + span * 0.18,
+                "cantidad": xmin + span * 0.58,
+                "unidad": xmin + span * 0.66,
+                "precio": xmin + span * 0.76,
+                "subtotal": xmin + span * 0.90,
+            }
+
+    # Para separar columnas usamos puntos medios entre posiciones X detectadas.
+    ordered = sorted((x, k) for k, x in cols.items())
+    bounds = []
+    for i, (x, k) in enumerate(ordered):
+        left = (ordered[i-1][0] + x) / 2 if i > 0 else -1e9
+        right = (x + ordered[i+1][0]) / 2 if i < len(ordered)-1 else 1e9
+        bounds.append((k, left, right))
+
+    def col_for_x(x):
+        for k, l, r in bounds:
+            if l <= x < r:
+                return k
+        return nearest_col_key(x, cols)
+
+    for row in rows:
+        txt = row_text(row)
+        ntxt = normalize_text(txt)
+        # Saltar encabezados/totales
+        if any(s in ntxt for s in [
+            "DESCRIPCION", "DESCRIPCIÓN", "CANTIDAD", "PRECIO UNITARIO",
+            "TOTAL GENERAL", "SUBTOTAL", "TOTAL A PAGAR", "IVA"
+        ]):
+            # permite filas que contienen subtotal si además parecen artículo? no, por seguridad.
+            if "TOTAL" in ntxt or "IVA" in ntxt or "DESCRIP" in ntxt:
+                continue
+
+        buckets = {}
+        for w in row["words"]:
+            k = col_for_x((w["x0"] + w["x1"]) / 2)
+            buckets.setdefault(k, []).append(w["text"])
+
+        desc = " ".join(buckets.get("descripcion", [])).strip()
+        code = " ".join(buckets.get("codigo", [])).strip()
+        qty_txt = " ".join(buckets.get("cantidad", [])).strip()
+        unit = " ".join(buckets.get("unidad", [])).strip() or "und"
+        price_txt = " ".join(buckets.get("precio", [])).strip()
+        subtotal_txt = " ".join(buckets.get("subtotal", [])).strip()
+
+        qty = parse_money(qty_txt) if qty_txt else 0
+        price = parse_money(price_txt) if price_txt else 0
+        subtotal = parse_money(subtotal_txt) if subtotal_txt else 0
+
+        # Fallback: si no se mapeó bien, tomamos los últimos números de la fila.
+        if qty <= 0 or price <= 0:
+            tail = parse_item_numbers_from_tail(txt)
+            if tail:
+                prefix, qty2, price2, total2 = tail
+                qty = qty or qty2
+                price = price or price2
+                subtotal = subtotal or total2
+                if not desc:
+                    desc = prefix
+
+        # Si código quedó metido en descripción, separarlo.
+        if not code and desc:
+            cm = re.match(r"^([A-Z0-9][A-Z0-9._/-]{2,})\s+(.+)$", desc, re.I)
+            if cm and re.search(r"\d", cm.group(1)):
+                code = cm.group(1)
+                desc = cm.group(2)
+
+        if desc and qty > 0 and price > 0:
+            if not subtotal:
+                subtotal = qty * price
+            expected = qty * price
+            # tolerancia 12% por descuentos/redondeos
+            if expected > 0 and subtotal > 0 and abs(subtotal - expected) / expected > 0.12:
+                # si el subtotal es claramente incompatible, descartar fila
+                if subtotal < price * 0.5 or subtotal > expected * 3:
+                    continue
+
+            results.append({
+                "orden": order_auto,
+                "codigo_proveedor": code,
+                "descripcion": desc,
+                "marca": detect_brand(desc),
+                "modelo": infer_model_reference(desc, code),
+                "cantidad": float(qty),
+                "unidad": unit or "und",
+                "precio_unitario": float(price),
+                "subtotal": float(subtotal),
+                "confirmado": True,
+            })
+            order_auto += 1
+
+    # Deduplicar por firma de negocio
+    unique = []
+    seen = set()
+    for r in results:
+        sig = (
+            normalize_text(r["codigo_proveedor"]),
+            normalize_text(r["descripcion"])[:100],
+            round(r["cantidad"], 4),
+            round(r["precio_unitario"], 4),
+            round(r["subtotal"], 4),
+        )
+        if sig not in seen:
+            seen.add(sig)
+            unique.append(r)
+    return unique
+
+
 def pdf_text_quality(text):
     """Devuelve métricas simples para distinguir PDF digital de escaneado."""
     raw = str(text or "")
@@ -2219,6 +2450,7 @@ def parse_supplier_pdf(uploaded_file):
     # Parsers generales: siempre se prueban.
     parser_candidates.append(("GENÉRICO", parse_items_generic(raw)))
     parser_candidates.append(("GENÉRICO ROBUSTO", parse_items_generic_robust(raw)))
+    parser_candidates.append(("COORDENADAS", parse_items_by_coordinates(uploaded_file)))
 
     best_name, best_items = max(
         parser_candidates,
@@ -3001,11 +3233,11 @@ elif page == "🏷️ Stock":
 
 
 # ============================================================
-# COMPRAS / OCR V3.9.3
+# COMPRAS / OCR V3.9.4
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.9.3: lector PDF robusto para presupuestos y facturas. Prueba varios motores y parsers antes de pedir revisión manual.")
+    st.success("V3.9.4: además del texto, reconstruye tablas por coordenadas X/Y para facturas y presupuestos con layout complejo.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -3087,6 +3319,7 @@ elif page == "🔎 Compras / OCR":
                             "Parser elegido": meta.get("parser_usado"),
                             "Ítems válidos": meta.get("items_detectados", len(parsed_items)),
                             "Requiere OCR": meta.get("requiere_ocr", False),
+                            "Modo posicional disponible": fitz is not None,
                             "Calidad texto": meta.get("calidad_texto", {}),
                         })
 
@@ -3098,7 +3331,7 @@ elif page == "🔎 Compras / OCR":
 
                     parsed_items = enrich_items_for_catalog(parsed_items, supplier_row_id_for_preview, currency)
                     st.markdown("#### Validar ítems")
-                    st.caption("V3.9.3: primero valida que la lectura del PDF sea confiable; después compara precios e historial.")
+                    st.caption("V3.9.4: usa texto + posición visual de columnas. Si la factura tiene capa de texto, intenta reconstruir las filas aunque el orden del texto sea complejo.")
                     comparison_df = purchase_comparison_summary(parsed_items)
                     if not comparison_df.empty:
                         st.markdown("##### 💰 Comparador de precios")
@@ -3601,6 +3834,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9.3 Lector PDF robusto</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9.4 Lector PDF por coordenadas</div>',
     unsafe_allow_html=True,
 )
