@@ -28,7 +28,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.6 - Compras PDF"
+APP_VERSION = "3.7 - PDF inteligente"
 
 
 st.markdown("""
@@ -1127,7 +1127,7 @@ def add_price(material_id, supplier_id, price, currency="PYG", date_value=None, 
 
 
 # ============================================================
-# COMPRAS / OCR V3.6 - PDF DIGITAL + VALIDACIÓN HUMANA
+# COMPRAS / OCR V3.7 - PDF INTELIGENTE + NORMALIZACIÓN DE MATERIALES
 # ============================================================
 SUPPLIER_ALIASES = {
     "ELECTROPAR": ["ELECTROPAR", "ELECTROPAR.COM.PY"],
@@ -1179,7 +1179,7 @@ def parse_money(value):
 
 def extract_pdf_text(uploaded_file):
     if PdfReader is None:
-        raise RuntimeError("Falta instalar pypdf. Subí también el requirements.txt V3.6.")
+        raise RuntimeError("Falta instalar pypdf. El requirements.txt actual debe incluir pypdf.")
     reader = PdfReader(io.BytesIO(uploaded_file.getvalue()))
     return "\n".join((page.extract_text() or "") for page in reader.pages)
 
@@ -1291,6 +1291,108 @@ def guess_category(desc):
         if key in padded:
             return cat
     return "Otro"
+
+
+def infer_model_reference(description, supplier_code=""):
+    """Intenta separar una referencia/modelo desde la descripción sin perder el texto original."""
+    desc = str(description or "").strip()
+    # Prioridad 1: texto después de la última barra, típico "... / LPCB6644".
+    if "/" in desc:
+        candidate = desc.rsplit("/", 1)[-1].strip().strip(" .,-")
+        if re.fullmatch(r"[A-Za-z0-9._-]{3,30}", candidate) and re.search(r"[A-Za-z]", candidate):
+            return candidate.upper()
+    # Prioridad 2: último token alfanumérico con letras y números.
+    tokens = re.findall(r"\b[A-Za-z][A-Za-z0-9._-]*\d[A-Za-z0-9._-]*\b", desc)
+    if tokens:
+        return tokens[-1].upper()
+    return ""
+
+
+def suggest_material_name(description, brand="", model=""):
+    """Genera un nombre corto y reutilizable para el catálogo, conservando la descripción original aparte."""
+    original = str(description or "").strip()
+    t = normalize_text(original)
+    b = normalize_text(brand)
+    m = normalize_text(model)
+
+    # Quita marca y referencias obvias del texto usado para el nombre.
+    if b:
+        t = re.sub(rf"^\s*{re.escape(b)}(?:[-\s]+\d+)?[-\s:]*", "", t).strip()
+    if m:
+        t = re.sub(rf"(?:\s*/\s*|\s+){re.escape(m)}\s*$", "", t).strip()
+    t = re.sub(r"^\d+[-\s]+", "", t).strip()
+
+    # Reglas industriales frecuentes: nombre estable, no dependiente del formato del proveedor.
+    rules = [
+        (r"PULSADOR.*EMERGENCIA", "Pulsador de emergencia"),
+        (r"CUERPO.*CONTACT", "Cuerpo para contactos"),
+        (r"SELECTOR.*2\s*POS", "Selector 2 posiciones"),
+        (r"CONTACTO\s+NA", "Contacto NA"),
+        (r"CONTACTO\s+NC", "Contacto NC"),
+        (r"RELE.*VOLTIMETR", "Relé voltimétrico trifásico" if "TRIF" in t else "Relé voltimétrico"),
+        (r"FILTRO.*VENTIL", "Filtro para ventilador"),
+        (r"INTERRUPTOR.*ROTAT", "Interruptor rotativo"),
+        (r"CONTACTOR", "Contactor"),
+        (r"BORNER", "Bornera"),
+        (r"TRANSMIS", "Transmisor"),
+        (r"SENSOR", "Sensor"),
+        (r"VARIADOR|CONV DE FREC|VFD", "Variador de frecuencia"),
+        (r"TERMOMAG", "Interruptor termomagnético"),
+        (r"DISYUNT", "Disyuntor"),
+        (r"PT100", "Sensor PT100"),
+    ]
+    for pattern, name in rules:
+        if re.search(pattern, t):
+            return name
+
+    # Fallback: limpia separadores y limita longitud para evitar nombres gigantes.
+    clean = re.sub(r"[_|]+", " ", t)
+    clean = re.sub(r"\s*/\s*[^/]{1,35}$", "", clean)
+    clean = re.sub(r"\s+", " ", clean).strip(" -,:;.")
+    if not clean:
+        return "Material importado"
+    return clean[:90].title()
+
+
+def enrich_items_for_catalog(items_df):
+    """Agrega sugerencia de Material y Acción a los ítems detectados del PDF."""
+    if items_df is None or items_df.empty:
+        return items_df
+    out = items_df.copy()
+    if "modelo" not in out.columns:
+        out["modelo"] = ""
+    materials = []
+    actions = []
+    for _, row in out.iterrows():
+        desc = str(row.get("descripcion", "") or "").strip()
+        brand = str(row.get("marca", "") or "").strip()
+        model = str(row.get("modelo", "") or "").strip()
+        if not model:
+            model = infer_model_reference(desc, row.get("codigo_proveedor", ""))
+        materials.append(suggest_material_name(desc, brand, model))
+        actions.append("Automático")
+        if model:
+            out.at[row.name, "modelo"] = model
+    out.insert(2, "material", materials)
+    out.insert(3, "accion", actions)
+    return out
+
+
+def find_material_catalog(name="", brand="", model=""):
+    mats = fetch_materials()
+    if mats.empty:
+        return None
+    nn, nb, nm = normalize_text(name), normalize_text(brand), normalize_text(model)
+    best = None
+    for _, r in mats.iterrows():
+        rn = normalize_text(r.get("nombre", "")); rb = normalize_text(r.get("marca", "")); rm = normalize_text(r.get("modelo", ""))
+        if nm and rm == nm and (not nb or rb == nb):
+            return r.to_dict()
+        if nn and rn == nn and (not nb or rb == nb) and (not nm or not rm or rm == nm):
+            return r.to_dict()
+        if nn and rn == nn and best is None:
+            best = r.to_dict()
+    return best
 
 
 def parse_items_comagro(text):
@@ -1418,14 +1520,26 @@ def find_material_exact(description, brand="", model=""):
     return None
 
 
-def create_material_from_item(row):
+def create_material_from_item(row, force_new=False, require_existing=False):
     desc=str(row.get("descripcion","") or "").strip()
     brand=str(row.get("marca","") or "").strip()
-    model=str(row.get("modelo","") or "").strip()
-    existing=find_material_exact(desc,brand,model)
-    if existing: return existing["id"]
-    # Para la carga automática, nombre = descripción completa (máx. 180) para preservar trazabilidad.
-    payload={"nombre":desc[:180] or "Material importado","categoria":guess_category(desc),"marca":brand or None,"modelo":model or None,"descripcion":desc or None,"activo":True}
+    model=str(row.get("modelo","") or "").strip() or infer_model_reference(desc, row.get("codigo_proveedor", ""))
+    material_name=str(row.get("material","") or "").strip() or suggest_material_name(desc, brand, model)
+
+    existing = None if force_new else find_material_catalog(material_name, brand, model)
+    if existing:
+        return existing["id"]
+    if require_existing:
+        raise ValueError(f'No encontré el material existente "{material_name}". Elegí Automático/Crear nuevo o corregí el nombre.')
+
+    payload={
+        "nombre":material_name[:180] or "Material importado",
+        "categoria":guess_category(desc or material_name),
+        "marca":brand or None,
+        "modelo":model or None,
+        "descripcion":desc or None,
+        "activo":True
+    }
     res=supabase.table("materiales").insert(payload).execute()
     return (res.data or [{}])[0].get("id")
 
@@ -1454,7 +1568,13 @@ def save_purchase_document(meta, items_df, supplier_id, auto_create_materials=Tr
         if not confirmed or not desc: continue
         material_id=None
         if auto_create_materials:
-            material_id=create_material_from_item(r)
+            action=str(r.get("accion","Automático") or "Automático").strip()
+            if action == "Usar existente":
+                material_id=create_material_from_item(r, require_existing=True)
+            elif action == "Crear nuevo":
+                material_id=create_material_from_item(r, force_new=True)
+            else:
+                material_id=create_material_from_item(r)
         qty=float(r.get("cantidad",0) or 0); price=float(r.get("precio_unitario",0) or 0); subtotal=float(r.get("subtotal",0) or 0)
         rows.append({
             "documento_id":doc_id,"orden":int(r.get("orden",idx+1) or idx+1),"codigo_proveedor":str(r.get("codigo_proveedor","") or "").strip() or None,
@@ -2087,7 +2207,7 @@ elif page == "🏷️ Stock":
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.6: podés cargar varios PDF, revisar lo detectado y recién después guardarlo en Supabase.")
+    st.success("V3.7: además de leer el PDF, normaliza el material y te deja decidir si usar uno existente o crear uno nuevo antes de guardar.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -2097,7 +2217,7 @@ elif page == "🔎 Compras / OCR":
             "Presupuestos / facturas PDF",
             type=["pdf"],
             accept_multiple_files=True,
-            key="purchase_pdf_upload_v36",
+            key="purchase_pdf_upload_v37",
             help="Podés seleccionar varios archivos al mismo tiempo. Los PDF digitales se leen directamente; los escaneados se marcarán para revisión/OCR posterior."
         )
         if not uploaded_pdfs:
@@ -2114,7 +2234,7 @@ elif page == "🔎 Compras / OCR":
                         continue
 
                     if len((meta.get("texto_extraido") or "").strip()) < 40:
-                        st.warning("Este archivo parece escaneado o no contiene texto extraíble. En esta V3.6 queda marcado para revisión; la siguiente etapa agregará OCR de imagen.")
+                        st.warning("Este archivo parece escaneado o no contiene texto extraíble. En esta V3.7 queda marcado para revisión; una próxima etapa agregará OCR de imagen.")
 
                     matched=match_supplier_row(meta.get("proveedor_sugerido"), suppliers_pdf)
                     supplier_names=suppliers_pdf["nombre"].astype(str).tolist() if not suppliers_pdf.empty else []
@@ -2141,7 +2261,9 @@ elif page == "🔎 Compras / OCR":
                         st.warning("No pude separar ítems automáticamente. Podés agregarlos manualmente en la tabla de abajo o dejar este PDF para la etapa OCR de imagen.")
                         parsed_items=pd.DataFrame([{"orden":1,"codigo_proveedor":"","descripcion":"","marca":"","modelo":"","cantidad":1.0,"unidad":"und","precio_unitario":0.0,"subtotal":0.0,"confirmado":True}])
 
+                    parsed_items = enrich_items_for_catalog(parsed_items)
                     st.markdown("#### Validar ítems")
+                    st.caption("Material = nombre normalizado de catálogo. Acción: Automático reutiliza coincidencias; Usar existente exige una coincidencia; Crear nuevo fuerza un alta nueva.")
                     edited=st.data_editor(
                         parsed_items,
                         hide_index=True,
@@ -2151,7 +2273,9 @@ elif page == "🔎 Compras / OCR":
                         column_config={
                             "orden": st.column_config.NumberColumn("#", min_value=1, step=1),
                             "codigo_proveedor": st.column_config.TextColumn("Código proveedor"),
-                            "descripcion": st.column_config.TextColumn("Descripción", width="large"),
+                            "material": st.column_config.TextColumn("Material", width="medium", help="Nombre corto y reutilizable para el catálogo."),
+                            "accion": st.column_config.SelectboxColumn("Acción", options=["Automático","Usar existente","Crear nuevo"], required=True),
+                            "descripcion": st.column_config.TextColumn("Descripción original", width="large"),
                             "marca": st.column_config.TextColumn("Marca"),
                             "modelo": st.column_config.TextColumn("Modelo / Ref."),
                             "cantidad": st.column_config.NumberColumn("Cantidad", min_value=0.0, step=1.0),
@@ -2165,7 +2289,7 @@ elif page == "🔎 Compras / OCR":
                         "Crear/vincular materiales automáticamente y actualizar historial de precios",
                         value=True,
                         key=f"auto_{digest}",
-                        help="Si el material no existe, se crea desde la descripción del PDF. Luego podés normalizar nombre, marca o modelo desde Proveedores / Materiales."
+                        help="V3.7 usa el nombre de la columna Material, intenta reutilizar coincidencias y conserva siempre la descripción original del proveedor."
                     )
 
                     if st.button("✅ Confirmar importación", type="primary", use_container_width=True, key=f"save_{digest}"):
@@ -2533,6 +2657,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.6 Compras PDF</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.7 PDF inteligente</div>',
     unsafe_allow_html=True,
 )
