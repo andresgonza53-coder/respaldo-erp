@@ -28,7 +28,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.9 - Historial inteligente de precios"
+APP_VERSION = "3.9.1 - Comparador de precios PDF"
 
 
 st.markdown("""
@@ -1116,12 +1116,36 @@ def add_material_supplier(material_id, supplier_id, priority=3, supplier_code=""
         "observacion": note.strip() or None, "activo": True
     }, on_conflict="material_id,proveedor_id").execute()
 
-def add_price(material_id, supplier_id, price, currency="PYG", date_value=None, source="Carga manual", note=""):
+def add_price(material_id, supplier_id, price, currency="PYG", date_value=None, source="Carga manual", note="", prevent_duplicate=False):
+    price_value = float(price)
+    date_iso = (date_value or date.today()).isoformat()
+    note_clean = note.strip() or None
+
+    # Segunda barrera para OCR/importaciones: evita registrar dos veces
+    # exactamente la misma referencia de precio.
+    if prevent_duplicate:
+        try:
+            q = (
+                supabase.table("historial_precios")
+                .select("id")
+                .eq("material_id", material_id)
+                .eq("proveedor_id", supplier_id)
+                .eq("precio", price_value)
+                .eq("moneda", currency)
+                .eq("fecha", date_iso)
+                .eq("fuente", source)
+            )
+            existing = q.limit(1).execute().data or []
+            if existing:
+                return None
+        except Exception:
+            pass
+
     return supabase.table("historial_precios").insert({
         "material_id": material_id, "proveedor_id": supplier_id,
-        "precio": float(price), "moneda": currency,
-        "fecha": (date_value or date.today()).isoformat(),
-        "fuente": source, "observacion": note.strip() or None,
+        "precio": price_value, "moneda": currency,
+        "fecha": date_iso,
+        "fuente": source, "observacion": note_clean,
         "registrado_por": getattr(st.session_state.auth_user, "email", "") or ""
     }).execute()
 
@@ -1164,6 +1188,42 @@ SUPPLIER_ALIASES = {
     "TECNO ELECTRIC": ["TECNOELECTRIC", "TECNO ELECTRIC", "TECNOELECTRIC.ODOO.COM"],
     "RECORD ELECTRIC": ["RECORD ELECTRIC"],
 }
+
+
+
+def clean_display_value(value):
+    """Evita mostrar None/nan/NaT en etiquetas del ERP."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    return "" if text.lower() in {"nan", "none", "nat"} else text
+
+
+def purchase_document_exists(supplier_id, number, dtype):
+    """Comprueba si el mismo documento ya fue importado."""
+    number = str(number or "").strip()
+    dtype = str(dtype or "Presupuesto").strip()
+    if not supplier_id or not number:
+        return None
+    try:
+        rows = (
+            supabase.table("documentos_compra")
+            .select("id,fecha,estado,archivo_nombre,creado_en")
+            .eq("proveedor_id", supplier_id)
+            .eq("numero_documento", number)
+            .eq("tipo_documento", dtype)
+            .limit(1)
+            .execute()
+            .data or []
+        )
+        return rows[0] if rows else None
+    except Exception:
+        return None
 
 
 def normalize_text(value):
@@ -1454,8 +1514,8 @@ def classify_material_match(name="", brand="", model="", mats=None):
     return "🔵 NUEVO — crear material", None
 
 
-def enrich_items_for_catalog(items_df):
-    """V3.8.1: agrega estado de catálogo y detecta repetidos dentro del mismo PDF."""
+def enrich_items_for_catalog(items_df, supplier_id=None, currency="PYG"):
+    """V3.9.1: catálogo + duplicados PDF + comparación de precios antes de importar."""
     if items_df is None or items_df.empty:
         return items_df
 
@@ -1464,40 +1524,152 @@ def enrich_items_for_catalog(items_df):
         out["modelo"] = ""
 
     mats = fetch_materials()
+
+    # Mapa código-proveedor -> material para el proveedor seleccionado.
+    supplier_code_map = {}
+    if supplier_id:
+        try:
+            rel = (
+                supabase.table("material_proveedor")
+                .select("material_id,codigo_proveedor")
+                .eq("proveedor_id", supplier_id)
+                .eq("activo", True)
+                .execute()
+                .data or []
+            )
+            for rr in rel:
+                code = normalize_text(clean_display_value(rr.get("codigo_proveedor")))
+                if code:
+                    supplier_code_map[code] = rr.get("material_id")
+        except Exception:
+            supplier_code_map = {}
+
+    # Historial se trae una sola vez para evitar muchas consultas.
+    try:
+        history = fetch_price_history()
+    except Exception:
+        history = pd.DataFrame()
+
     materials, statuses, matches, actions = [], [], [], []
+    last_prices, last_dates, variations = [], [], []
+    best_prices, best_suppliers, indicators = [], [], []
     seen_pdf = {}
 
+    def mat_row_by_id(mid):
+        if not mid or mats is None or mats.empty or "id" not in mats.columns:
+            return None
+        hit = mats[mats["id"].astype(str).eq(str(mid))]
+        return hit.iloc[0].to_dict() if not hit.empty else None
+
+    def price_info(material_id, current_price):
+        if not material_id or history is None or history.empty:
+            return "", "", "", "", "", "⚪ Sin historial"
+
+        h = history[history["material_id"].astype(str).eq(str(material_id))].copy()
+        if h.empty:
+            return "", "", "", "", "", "⚪ Sin historial"
+
+        if "moneda" in h.columns:
+            same = h[h["moneda"].fillna("").astype(str).str.upper().eq(str(currency).upper())].copy()
+            if not same.empty:
+                h = same
+
+        h["precio_num"] = pd.to_numeric(h.get("precio"), errors="coerce")
+        h["fecha_dt"] = pd.to_datetime(h.get("fecha"), errors="coerce")
+        h = h.dropna(subset=["precio_num"]).sort_values(["fecha_dt"], ascending=False)
+        if h.empty:
+            return "", "", "", "", "", "⚪ Sin historial"
+
+        last = h.iloc[0]
+        best = h.loc[h["precio_num"].idxmin()]
+        last_price = float(last["precio_num"])
+        current = float(current_price or 0)
+
+        variation = ""
+        indicator = "🟡 Sin cambio"
+        if current > 0 and last_price > 0:
+            pct = (current / last_price - 1.0) * 100.0
+            variation = pct
+            if pct < -0.5:
+                indicator = "🟢 Bajó"
+            elif pct > 0.5:
+                indicator = "🔴 Subió"
+            else:
+                indicator = "🟡 Igual"
+
+        return (
+            last_price,
+            clean_display_value(last.get("fecha")),
+            variation,
+            float(best["precio_num"]),
+            clean_display_value(best.get("Proveedor")),
+            indicator,
+        )
+
     for pos, (idx, row) in enumerate(out.iterrows(), start=1):
-        desc = str(row.get("descripcion", "") or "").strip()
-        brand = str(row.get("marca", "") or "").strip()
-        model = str(row.get("modelo", "") or "").strip()
+        desc = clean_display_value(row.get("descripcion"))
+        brand = clean_display_value(row.get("marca"))
+        model = clean_display_value(row.get("modelo"))
+        supplier_code = clean_display_value(row.get("codigo_proveedor"))
+        current_price = float(row.get("precio_unitario", 0) or 0)
 
         if not model:
-            model = infer_model_reference(desc, row.get("codigo_proveedor", ""))
+            model = infer_model_reference(desc, supplier_code)
 
         material_name = suggest_material_name(desc, brand, model)
         pdf_key = material_identity_key(material_name, brand, model)
 
-        # Primero detectamos repetidos dentro del mismo documento.
-        if pdf_key and pdf_key in seen_pdf:
+        match = None
+        matched_material_id = None
+
+        # 0) Mayor prioridad operativa: código propio de este proveedor.
+        code_key = normalize_text(supplier_code)
+        if code_key and code_key in supplier_code_map:
+            matched_material_id = supplier_code_map[code_key]
+            match = mat_row_by_id(matched_material_id)
+            if match:
+                status = "🟢 EXISTENTE — código proveedor"
+                match_label = " | ".join(
+                    x for x in [
+                        clean_display_value(match.get("nombre")),
+                        clean_display_value(match.get("marca")),
+                        clean_display_value(match.get("modelo")),
+                    ] if x
+                )
+                action = "Usar existente"
+            else:
+                status = ""
+                match_label = ""
+                action = "Automático"
+        else:
+            status = ""
+            match_label = ""
+            action = "Automático"
+
+        # 1) Repetido dentro del PDF.
+        if not match and pdf_key and pdf_key in seen_pdf:
             first = seen_pdf[pdf_key]
             status = "🟣 MISMO PDF — reutilizar"
-            match = None
+            matched_material_id = first.get("material_id")
             match_label = (
                 f"Fila {first['fila']} | {first['material']}"
                 + (f" | {first['marca']}" if first["marca"] else "")
                 + (f" | {first['modelo']}" if first["modelo"] else "")
             )
             action = "Automático"
-        else:
-            status, match = classify_material_match(material_name, brand, model, mats)
 
+        # 2) Catálogo por marca+modelo / nombre+marca.
+        if not status:
+            status, match = classify_material_match(material_name, brand, model, mats)
             if match:
-                match_label = " | ".join([x for x in [
-                    str(match.get("nombre", "") or "").strip(),
-                    str(match.get("marca", "") or "").strip(),
-                    str(match.get("modelo", "") or "").strip(),
-                ] if x])
+                matched_material_id = match.get("id")
+                match_label = " | ".join(
+                    x for x in [
+                        clean_display_value(match.get("nombre")),
+                        clean_display_value(match.get("marca")),
+                        clean_display_value(match.get("modelo")),
+                    ] if x
+                )
             else:
                 match_label = ""
 
@@ -1508,18 +1680,27 @@ def enrich_items_for_catalog(items_df):
             else:
                 action = "Automático"
 
-            if pdf_key:
-                seen_pdf[pdf_key] = {
-                    "fila": pos,
-                    "material": material_name,
-                    "marca": brand,
-                    "modelo": model,
-                }
+        if pdf_key and pdf_key not in seen_pdf:
+            seen_pdf[pdf_key] = {
+                "fila": pos,
+                "material": material_name,
+                "marca": brand,
+                "modelo": model,
+                "material_id": matched_material_id,
+            }
+
+        lp, ld, var, bp, bs, ind = price_info(matched_material_id, current_price)
 
         materials.append(material_name)
         statuses.append(status)
         matches.append(match_label)
         actions.append(action)
+        last_prices.append(lp)
+        last_dates.append(ld)
+        variations.append(var)
+        best_prices.append(bp)
+        best_suppliers.append(bs)
+        indicators.append(ind)
 
         if model:
             out.at[idx, "modelo"] = model
@@ -1528,6 +1709,15 @@ def enrich_items_for_catalog(items_df):
     out.insert(3, "estado_catalogo", statuses)
     out.insert(4, "coincidencia", matches)
     out.insert(5, "accion", actions)
+
+    # Comparador de compra
+    out["ultimo_precio"] = last_prices
+    out["fecha_ultimo_precio"] = last_dates
+    out["variacion_pct"] = variations
+    out["mejor_precio"] = best_prices
+    out["mejor_proveedor"] = best_suppliers
+    out["tendencia_precio"] = indicators
+
     return out
 
 
@@ -1775,7 +1965,16 @@ def save_purchase_document(meta, items_df, supplier_id, auto_create_materials=Tr
             except Exception:
                 pass
             if price > 0:
-                add_price(material_id, supplier_id, price, meta.get("moneda") or "PYG", meta.get("fecha") or date.today(), "Factura" if dtype=="Factura" else "Cotización", f"Documento {number} · Cantidad {qty:g} · Subtotal {subtotal or (qty*price):.0f}")
+                add_price(
+                    material_id,
+                    supplier_id,
+                    price,
+                    meta.get("moneda") or "PYG",
+                    meta.get("fecha") or date.today(),
+                    "Factura" if dtype=="Factura" else "Cotización",
+                    f"Documento {number} · Cantidad {qty:g} · Subtotal {subtotal or (qty*price):.0f}",
+                    prevent_duplicate=True,
+                )
     if rows:
         supabase.table("documentos_compra_items").insert(rows).execute()
     return doc_id, len(rows)
@@ -2390,11 +2589,11 @@ elif page == "🏷️ Stock":
 
 
 # ============================================================
-# COMPRAS / OCR V3.6
+# COMPRAS / OCR V3.9.1
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.7: además de leer el PDF, normaliza el material y te deja decidir si usar uno existente o crear uno nuevo antes de guardar.")
+    st.success("V3.9.1: identifica materiales, bloquea documentos repetidos y compara el precio del PDF contra el historial antes de guardar.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -2448,9 +2647,15 @@ elif page == "🔎 Compras / OCR":
                         st.warning("No pude separar ítems automáticamente. Podés agregarlos manualmente en la tabla de abajo o dejar este PDF para la etapa OCR de imagen.")
                         parsed_items=pd.DataFrame([{"orden":1,"codigo_proveedor":"","descripcion":"","marca":"","modelo":"","cantidad":1.0,"unidad":"und","precio_unitario":0.0,"subtotal":0.0,"confirmado":True}])
 
-                    parsed_items = enrich_items_for_catalog(parsed_items)
+                    supplier_row_id_for_preview = None
+                    if supplier_names and supplier_name:
+                        _sr_preview = suppliers_pdf[suppliers_pdf["nombre"].astype(str).eq(supplier_name)]
+                        if not _sr_preview.empty:
+                            supplier_row_id_for_preview = _sr_preview.iloc[0].get("id")
+
+                    parsed_items = enrich_items_for_catalog(parsed_items, supplier_row_id_for_preview, currency)
                     st.markdown("#### Validar ítems")
-                    st.caption("V3.8.1: 🟢 existente se reutiliza; 🟡 posible coincidencia requiere revisión; 🔵 nuevo se crea; 🟣 mismo PDF reutiliza el material de la primera fila. La Acción sigue siendo editable antes de guardar.")
+                    st.caption("V3.9.1: además del estado del catálogo, compará Precio actual vs Último precio, variación y mejor precio histórico. 🟢 bajó · 🟡 igual · 🔴 subió.")
                     edited=st.data_editor(
                         parsed_items,
                         hide_index=True,
@@ -2463,6 +2668,12 @@ elif page == "🔎 Compras / OCR":
                             "material": st.column_config.TextColumn("Material", width="medium", help="Nombre corto y reutilizable para el catálogo."),
                             "estado_catalogo": st.column_config.TextColumn("Estado catálogo", width="large", disabled=True),
                             "coincidencia": st.column_config.TextColumn("Coincidencia detectada", width="large", disabled=True),
+                            "ultimo_precio": st.column_config.NumberColumn("Último precio", min_value=0.0, format="%.0f", disabled=True),
+                            "fecha_ultimo_precio": st.column_config.TextColumn("Fecha último", disabled=True),
+                            "variacion_pct": st.column_config.NumberColumn("Variación %", format="%.1f%%", disabled=True),
+                            "mejor_precio": st.column_config.NumberColumn("Mejor precio", min_value=0.0, format="%.0f", disabled=True),
+                            "mejor_proveedor": st.column_config.TextColumn("Mejor proveedor", disabled=True),
+                            "tendencia_precio": st.column_config.TextColumn("Tendencia", disabled=True),
                             "accion": st.column_config.SelectboxColumn("Acción", options=["Automático","Usar existente","Crear nuevo"], required=True),
                             "descripcion": st.column_config.TextColumn("Descripción original", width="large"),
                             "marca": st.column_config.TextColumn("Marca"),
@@ -2478,10 +2689,28 @@ elif page == "🔎 Compras / OCR":
                         "Crear/vincular materiales automáticamente y actualizar historial de precios",
                         value=True,
                         key=f"auto_{digest}",
-                        help="V3.8.1 reutiliza coincidencias de alta confianza y también repetidos dentro del mismo PDF. Siempre se conserva la descripción original del proveedor."
+                        help="V3.9.1 reutiliza coincidencias de alta confianza, códigos del proveedor y repetidos dentro del mismo PDF. El documento repetido se bloquea."
                     )
 
-                    if st.button("✅ Confirmar importación", type="primary", use_container_width=True, key=f"save_{digest}"):
+                    duplicate_doc = None
+                    if supplier_row_id_for_preview and doc_number.strip():
+                        duplicate_doc = purchase_document_exists(supplier_row_id_for_preview, doc_number.strip(), doc_type)
+
+                    if duplicate_doc:
+                        dup_date = clean_display_value(duplicate_doc.get("fecha"))
+                        st.error(
+                            f"⛔ Este {doc_type.lower()} Nº {doc_number.strip()} ya fue importado"
+                            + (f" con fecha {dup_date}" if dup_date else "")
+                            + ". No se volverán a registrar sus precios."
+                        )
+
+                    if st.button(
+                        "✅ Confirmar importación",
+                        type="primary",
+                        use_container_width=True,
+                        key=f"save_{digest}",
+                        disabled=bool(duplicate_doc),
+                    ):
                         if not supplier_names:
                             st.warning("Primero cargá al menos un proveedor en Proveedores / Materiales.")
                         elif not doc_number.strip():
@@ -2896,6 +3125,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9 Historial inteligente de precios</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9.1 Comparador de precios PDF</div>',
     unsafe_allow_html=True,
 )
