@@ -28,7 +28,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.7 - PDF inteligente"
+APP_VERSION = "3.8 - Duplicados inteligentes"
 
 
 st.markdown("""
@@ -1354,46 +1354,126 @@ def suggest_material_name(description, brand="", model=""):
     return clean[:90].title()
 
 
+def classify_material_match(name="", brand="", model="", mats=None):
+    """Clasifica la coincidencia del catálogo priorizando Marca + Modelo/Referencia.
+
+    Retorna: (estado, coincidencia_dict_o_None)
+    estados: EXISTENTE, POSIBLE, NUEVO.
+    """
+    if mats is None:
+        mats = fetch_materials()
+    if mats is None or mats.empty:
+        return "🔵 NUEVO — crear material", None
+
+    nn = normalize_text(name)
+    nb = normalize_text(brand)
+    nm = normalize_text(model)
+
+    rows = [r.to_dict() for _, r in mats.iterrows()]
+
+    # 1) Máxima confianza: misma marca + mismo modelo/referencia.
+    if nm and nb:
+        for r in rows:
+            if normalize_text(r.get("modelo", "")) == nm and normalize_text(r.get("marca", "")) == nb:
+                return "🟢 EXISTENTE — reutilizar", r
+
+    # 2) Si no hay modelo, nombre normalizado + marca exacta es suficiente.
+    if nn and nb and not nm:
+        for r in rows:
+            if normalize_text(r.get("nombre", "")) == nn and normalize_text(r.get("marca", "")) == nb:
+                return "🟢 EXISTENTE — reutilizar", r
+
+    # 3) Posibles coincidencias: requieren revisión humana.
+    # Mismo modelo pero marca ausente/diferente.
+    if nm:
+        for r in rows:
+            if normalize_text(r.get("modelo", "")) == nm:
+                return "🟡 POSIBLE COINCIDENCIA — revisar", r
+
+    # Mismo nombre + misma marca, pero modelo distinto o incompleto.
+    if nn and nb:
+        for r in rows:
+            if normalize_text(r.get("nombre", "")) == nn and normalize_text(r.get("marca", "")) == nb:
+                return "🟡 POSIBLE COINCIDENCIA — revisar", r
+
+    # Mismo nombre sin poder confirmar marca/modelo.
+    if nn:
+        for r in rows:
+            if normalize_text(r.get("nombre", "")) == nn:
+                return "🟡 POSIBLE COINCIDENCIA — revisar", r
+
+    return "🔵 NUEVO — crear material", None
+
+
 def enrich_items_for_catalog(items_df):
-    """Agrega sugerencia de Material y Acción a los ítems detectados del PDF."""
+    """Agrega Material, Estado catálogo, Coincidencia y Acción a los ítems del PDF."""
     if items_df is None or items_df.empty:
         return items_df
     out = items_df.copy()
     if "modelo" not in out.columns:
         out["modelo"] = ""
-    materials = []
-    actions = []
+
+    mats = fetch_materials()
+    materials, statuses, matches, actions = [], [], [], []
+
     for _, row in out.iterrows():
         desc = str(row.get("descripcion", "") or "").strip()
         brand = str(row.get("marca", "") or "").strip()
         model = str(row.get("modelo", "") or "").strip()
         if not model:
             model = infer_model_reference(desc, row.get("codigo_proveedor", ""))
-        materials.append(suggest_material_name(desc, brand, model))
-        actions.append("Automático")
+        material_name = suggest_material_name(desc, brand, model)
+        status, match = classify_material_match(material_name, brand, model, mats)
+
+        materials.append(material_name)
+        statuses.append(status)
+        if match:
+            match_label = " | ".join([x for x in [
+                str(match.get("nombre", "") or "").strip(),
+                str(match.get("marca", "") or "").strip(),
+                str(match.get("modelo", "") or "").strip(),
+            ] if x])
+        else:
+            match_label = ""
+        matches.append(match_label)
+
+        if status.startswith("🟢"):
+            actions.append("Usar existente")
+        elif status.startswith("🔵"):
+            actions.append("Crear nuevo")
+        else:
+            actions.append("Automático")
+
         if model:
             out.at[row.name, "modelo"] = model
+
     out.insert(2, "material", materials)
-    out.insert(3, "accion", actions)
+    out.insert(3, "estado_catalogo", statuses)
+    out.insert(4, "coincidencia", matches)
+    out.insert(5, "accion", actions)
     return out
 
 
 def find_material_catalog(name="", brand="", model=""):
+    """Devuelve solo coincidencias de alta confianza para evitar reutilizar falsos duplicados."""
     mats = fetch_materials()
     if mats.empty:
         return None
     nn, nb, nm = normalize_text(name), normalize_text(brand), normalize_text(model)
-    best = None
-    for _, r in mats.iterrows():
-        rn = normalize_text(r.get("nombre", "")); rb = normalize_text(r.get("marca", "")); rm = normalize_text(r.get("modelo", ""))
-        if nm and rm == nm and (not nb or rb == nb):
-            return r.to_dict()
-        if nn and rn == nn and (not nb or rb == nb) and (not nm or not rm or rm == nm):
-            return r.to_dict()
-        if nn and rn == nn and best is None:
-            best = r.to_dict()
-    return best
 
+    # Prioridad absoluta: Marca + Modelo/Referencia.
+    if nm and nb:
+        for _, r in mats.iterrows():
+            if normalize_text(r.get("modelo", "")) == nm and normalize_text(r.get("marca", "")) == nb:
+                return r.to_dict()
+
+    # Sin modelo: Nombre + Marca exactos.
+    if nn and nb and not nm:
+        for _, r in mats.iterrows():
+            if normalize_text(r.get("nombre", "")) == nn and normalize_text(r.get("marca", "")) == nb:
+                return r.to_dict()
+
+    return None
 
 def parse_items_comagro(text):
     rows=[]
@@ -2234,7 +2314,7 @@ elif page == "🔎 Compras / OCR":
                         continue
 
                     if len((meta.get("texto_extraido") or "").strip()) < 40:
-                        st.warning("Este archivo parece escaneado o no contiene texto extraíble. En esta V3.7 queda marcado para revisión; una próxima etapa agregará OCR de imagen.")
+                        st.warning("Este archivo parece escaneado o no contiene texto extraíble. En esta V3.8 queda marcado para revisión; una próxima etapa agregará OCR de imagen.")
 
                     matched=match_supplier_row(meta.get("proveedor_sugerido"), suppliers_pdf)
                     supplier_names=suppliers_pdf["nombre"].astype(str).tolist() if not suppliers_pdf.empty else []
@@ -2263,7 +2343,7 @@ elif page == "🔎 Compras / OCR":
 
                     parsed_items = enrich_items_for_catalog(parsed_items)
                     st.markdown("#### Validar ítems")
-                    st.caption("Material = nombre normalizado de catálogo. Acción: Automático reutiliza coincidencias; Usar existente exige una coincidencia; Crear nuevo fuerza un alta nueva.")
+                    st.caption("V3.8 prioriza Marca + Modelo/Referencia: 🟢 existente se reutiliza; 🟡 posible coincidencia requiere revisión; 🔵 nuevo se crea. La Acción sigue siendo editable antes de guardar.")
                     edited=st.data_editor(
                         parsed_items,
                         hide_index=True,
@@ -2274,6 +2354,8 @@ elif page == "🔎 Compras / OCR":
                             "orden": st.column_config.NumberColumn("#", min_value=1, step=1),
                             "codigo_proveedor": st.column_config.TextColumn("Código proveedor"),
                             "material": st.column_config.TextColumn("Material", width="medium", help="Nombre corto y reutilizable para el catálogo."),
+                            "estado_catalogo": st.column_config.TextColumn("Estado catálogo", width="large", disabled=True),
+                            "coincidencia": st.column_config.TextColumn("Coincidencia detectada", width="large", disabled=True),
                             "accion": st.column_config.SelectboxColumn("Acción", options=["Automático","Usar existente","Crear nuevo"], required=True),
                             "descripcion": st.column_config.TextColumn("Descripción original", width="large"),
                             "marca": st.column_config.TextColumn("Marca"),
@@ -2289,7 +2371,7 @@ elif page == "🔎 Compras / OCR":
                         "Crear/vincular materiales automáticamente y actualizar historial de precios",
                         value=True,
                         key=f"auto_{digest}",
-                        help="V3.7 usa el nombre de la columna Material, intenta reutilizar coincidencias y conserva siempre la descripción original del proveedor."
+                        help="V3.8 reutiliza automáticamente solo coincidencias de alta confianza. Las posibles coincidencias quedan visibles para revisión y siempre se conserva la descripción original del proveedor."
                     )
 
                     if st.button("✅ Confirmar importación", type="primary", use_container_width=True, key=f"save_{digest}"):
