@@ -33,7 +33,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.9.4 - Lector PDF por coordenadas"
+APP_VERSION = "3.9.5 - Lectura validada por proveedor"
 
 
 st.markdown("""
@@ -1189,7 +1189,7 @@ def fetch_price_history(material_id=None, supplier_id=None):
 SUPPLIER_ALIASES = {
     "ELECTROPAR": ["ELECTROPAR", "ELECTROPAR.COM.PY"],
     "COMAGRO": ["COMAGRO"],
-    "CCP": ["PRESUP CHILE", "PRESUP. CHILE", "COMPAÑIA COMERCIAL DEL PARAGUAY", "COMPANIA COMERCIAL DEL PARAGUAY"],
+    "CCP": ["PRESUP DIGITAL CH", "PRESUP. DIGITAL CH", "80140053-8", "COMPAÑIA COMERCIAL DEL PARAGUAY", "COMPANIA COMERCIAL DEL PARAGUAY"],
     "TECNO ELECTRIC": ["TECNOELECTRIC", "TECNO ELECTRIC", "TECNOELECTRIC.ODOO.COM"],
     "RECORD ELECTRIC": ["RECORD ELECTRIC"],
 }
@@ -1306,7 +1306,8 @@ def extract_pdf_text(uploaded_file):
             pass
 
     if not candidates:
-        raise RuntimeError("No se pudo extraer texto del PDF. Verificá que pypdf o pymupdf estén instalados.")
+        # PDF de imagen puro: devolvemos vacío para que el flujo lo marque como OCR.
+        return ""
 
     def quality_score(value):
         lines = [x.strip() for x in value.splitlines() if x.strip()]
@@ -1570,15 +1571,31 @@ def pdf_text_quality(text):
 
 def detect_document_type(text):
     n = normalize_text(text)
+
+    # Señales fuertes primero.
+    if any(token in n for token in [
+        "PRESUP DIGITAL", "PRESUP. DIGITAL", "PRESUPUESTO",
+        "COTIZACION", "COTIZACIÓN", "PROPUESTA COMERCIAL",
+        "OFERTA", "PROFORMA"
+    ]):
+        return "Presupuesto"
+
+    if any(token in n for token in [
+        "FACTURA ELECTRONICA", "FACTURA ELECTRÓNICA",
+        "KUDE", "CDC", "TIMBRADO", "FACTURA NRO"
+    ]):
+        return "Factura"
+
+    # "RUC" aparece también en presupuestos, por eso no se usa como señal fuerte.
     factura_score = sum(1 for token in [
-        "FACTURA", "TIMBRADO", "RUC", "IVA 10", "IVA_10", "CONDICION DE VENTA",
-        "CDC", "KUDE"
+        "FACTURA", "IVA 10", "IVA_10", "CONDICION DE VENTA"
     ] if token in n)
     presupuesto_score = sum(1 for token in [
-        "PRESUPUESTO", "COTIZACION", "COTIZACIÓN", "OFERTA", "PROFORMA",
-        "NOTA DE PRESUPUESTO"
-    ] if normalize_text(token) in n)
+        "PRESUP", "COTIZ", "PROPUESTA", "OFERTA"
+    ] if token in n)
+
     return "Factura" if factura_score > presupuesto_score else "Presupuesto"
+
 
 
 def normalize_pdf_lines(text):
@@ -1659,6 +1676,7 @@ def match_supplier_row(suggested, suppliers_df):
 
 def extract_doc_number(text, filename=""):
     patterns = [
+        r"PRESUP\.?\s*DIGITAL\s+CH\s+Nro\.?\s*[:\s]*([A-Z0-9-]+)",
         r"([0-9]{4,})\s*Cotizaci[oó]n\s*N[º°o.:\s]*",
         r"Cotizaci[oó]n\s*N[º°o.:\s]*([A-Z0-9-]+)",
         r"PRESUP\.?\s*Chile\s*Nro\.?\s*[:\s]*([A-Z0-9-]+)",
@@ -2173,26 +2191,188 @@ def parse_items_comagro(text):
 
 
 def parse_items_tecno(text):
-    lines=[x.strip() for x in text.splitlines() if x.strip()]
-    rows=[]; i=0
+    """Parser Tecno Electric / Odoo.
+
+    Soporta filas como:
+    1
+    [TM241CE40T] M241 PLC ...
+    1 Unidad(es)
+    8.104.881
+    8.104.881 ₲
+    """
+    lines = [x.strip() for x in str(text or "").splitlines() if x.strip()]
+    rows = []
+    i = 0
+
     while i < len(lines):
-        m=re.match(r"^(\d+)\s*$", lines[i])
-        if m and i+1 < len(lines) and lines[i+1].startswith("["):
-            order=int(m.group(1)); desc=lines[i+1]; j=i+2
-            # Descripción puede continuar antes de cantidad.
-            while j < len(lines) and not re.fullmatch(r"\d+(?:[.,]\d+)?", lines[j]) and j-i < 6:
-                desc += " " + lines[j]; j+=1
-            if j+3 < len(lines):
-                qty=parse_money(lines[j]); unit=lines[j+1]
-                price=parse_money(lines[j+2]); total=parse_money(lines[j+3])
-                code=""
-                cm=re.match(r"^\[([^]]+)\]\s*(.*)$", desc)
-                if cm:
-                    code=cm.group(1); desc=cm.group(2).strip()
-                rows.append({"orden":order,"codigo_proveedor":code,"descripcion":desc,"marca":detect_brand(desc),"modelo":code,"cantidad":qty,"unidad":unit,"precio_unitario":price,"subtotal":total,"confirmado":True})
-                i=j+4; continue
-        i+=1
+        m = re.fullmatch(r"(\d+)", lines[i])
+        if m and i + 1 < len(lines) and lines[i + 1].startswith("["):
+            order = int(m.group(1))
+            cm = re.match(r"^\[([^]]+)\]\s*(.+)$", lines[i + 1])
+            if not cm:
+                i += 1
+                continue
+
+            code = cm.group(1).strip()
+            desc = cm.group(2).strip()
+
+            if i + 4 < len(lines):
+                qm = re.match(r"^(\d+(?:[.,]\d+)?)\s+(.+)$", lines[i + 2])
+                if qm:
+                    qty = parse_money(qm.group(1))
+                    unit = qm.group(2).strip()
+                    price = parse_money(lines[i + 3])
+                    subtotal = parse_money(lines[i + 4])
+
+                    if qty > 0 and price > 0 and subtotal > 0:
+                        expected = qty * price
+                        if expected and abs(subtotal - expected) / expected <= 0.03:
+                            rows.append({
+                                "orden": order,
+                                "codigo_proveedor": code,
+                                "descripcion": desc,
+                                "marca": detect_brand(desc),
+                                "modelo": code,
+                                "cantidad": float(qty),
+                                "unidad": unit,
+                                "precio_unitario": float(price),
+                                "subtotal": float(subtotal),
+                                "confirmado": True,
+                            })
+                            i += 5
+                            continue
+        i += 1
+
     return rows
+
+
+
+def parse_items_ccp_coordinates(uploaded_file):
+    """Parser CCP estable para PRESUP. DIGITAL CH.
+
+    Probado contra:
+    - 39195: 8 ítems, 2 páginas
+    - 39196: 1 ítem, 1 página
+
+    Usa las columnas reales del encabezado y permite descripciones multilínea.
+    """
+    if fitz is None:
+        return []
+
+    data = uploaded_file.getvalue()
+    results = []
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+    except Exception:
+        return []
+
+    for page in doc:
+        words = page.get_text("words") or []
+        if not words:
+            continue
+
+        header_code = [
+            w for w in words
+            if normalize_text(w[4]) in {"CODIGO", "CÓDIGO"}
+        ]
+        if not header_code:
+            continue
+
+        header_y = float(header_code[0][1])
+
+        def hx(names, default):
+            wanted = {normalize_text(x) for x in names}
+            for w in words:
+                if abs(float(w[1]) - header_y) <= 3.5 and normalize_text(w[4]) in wanted:
+                    return float(w[0])
+            return default
+
+        x_code = hx(["Codigo", "Código"], 41.0)
+        x_desc = hx(["Detalle"], 82.0)
+        x_brand = hx(["Marca"], 238.0)
+        x_qty = hx(["Cant.", "Cant", "Cantidad"], 300.0)
+        x_price = hx(["Pr.", "Precio"], 346.0)
+        x_exento = hx(["Exento"], 419.0)
+        x_total = hx(["Gravado", "Total", "Importe"], 480.0)
+
+        starts = [
+            w for w in words
+            if float(w[1]) > header_y
+            and float(w[0]) < max(35.0, x_code - 3)
+            and re.fullmatch(r"\d+\.", str(w[4]).strip())
+        ]
+        starts = sorted(starts, key=lambda w: float(w[1]))
+
+        for idx, sw in enumerate(starts):
+            base_y = float(sw[1])
+            next_y = (
+                float(starts[idx + 1][1])
+                if idx + 1 < len(starts)
+                else min(base_y + 48.0, float(page.rect.height))
+            )
+
+            base_words = [
+                w for w in words
+                if abs(float(w[1]) - base_y) <= 3.8
+            ]
+
+            def tokens_between(xa, xb):
+                return [
+                    str(w[4]).strip()
+                    for w in sorted(base_words, key=lambda z: float(z[0]))
+                    if xa <= float(w[0]) < xb and str(w[4]).strip()
+                ]
+
+            code = " ".join(tokens_between(x_code - 5, x_desc - 2)).strip()
+            brand = " ".join(tokens_between(x_brand - 15, x_qty - 5)).strip()
+            qty_txt = " ".join(tokens_between(x_qty - 10, x_price - 3)).strip()
+            price_txt = " ".join(tokens_between(x_price - 5, x_exento - 5)).strip()
+            total_txt = " ".join(tokens_between(x_total - 12, 9999)).strip()
+
+            # Descripción: todas las palabras de la banda descripción, incluyendo líneas siguientes.
+            desc_words = [
+                w for w in words
+                if x_desc - 2 <= float(w[0]) < x_brand - 5
+                and base_y - 2 <= float(w[1]) < next_y - 2
+            ]
+            desc_words = sorted(desc_words, key=lambda z: (float(z[1]), float(z[0])))
+            desc = " ".join(str(w[4]).strip() for w in desc_words if str(w[4]).strip()).strip()
+
+            qty = parse_money(qty_txt) if qty_txt else 0
+            price = parse_money(price_txt) if price_txt else 0
+            subtotal = parse_money(total_txt) if total_txt else 0
+
+            if not desc or qty <= 0 or price <= 0:
+                continue
+
+            if subtotal <= 0:
+                subtotal = qty * price
+
+            # Validación contable flexible.
+            expected = qty * price
+            if expected > 0:
+                error = abs(subtotal - expected) / expected
+                if error > 0.03:
+                    continue
+
+            clean_brand = clean_display_value(brand)
+            if normalize_text(clean_brand) == "INDEFINIDA":
+                clean_brand = ""
+
+            results.append({
+                "orden": int(str(sw[4]).replace(".", "")),
+                "codigo_proveedor": code,
+                "descripcion": desc,
+                "marca": clean_brand or detect_brand(desc),
+                "modelo": infer_model_reference(desc, code),
+                "cantidad": float(qty),
+                "unidad": "und",
+                "precio_unitario": float(price),
+                "subtotal": float(subtotal),
+                "confirmado": True,
+            })
+
+    return results
 
 
 def parse_items_ccp(text):
@@ -2442,8 +2622,13 @@ def parse_supplier_pdf(uploaded_file):
         parser_candidates.append(("COMAGRO", parse_items_comagro(raw)))
     if "ELECTROPAR" in n:
         parser_candidates.append(("ELECTROPAR", parse_items_electropar(raw)))
-    if "PRESUP CHILE" in n or "PRESUP. CHILE" in n or "COMPAÑIA COMERCIAL DEL PARAGUAY" in n:
-        parser_candidates.append(("CCP", parse_items_ccp(raw)))
+    if (
+        "PRESUP DIGITAL CH" in n
+        or "80140053-8" in n
+        or "COMPAÑIA COMERCIAL DEL PARAGUAY" in n
+    ):
+        parser_candidates.append(("CCP TEXTO", parse_items_ccp(raw)))
+        parser_candidates.append(("CCP COORDENADAS", parse_items_ccp_coordinates(uploaded_file)))
     if "TECNOELECTRIC" in n or "TECNO ELECTRIC" in n:
         parser_candidates.append(("TECNO ELECTRIC", parse_items_tecno(raw)))
 
@@ -2451,6 +2636,14 @@ def parse_supplier_pdf(uploaded_file):
     parser_candidates.append(("GENÉRICO", parse_items_generic(raw)))
     parser_candidates.append(("GENÉRICO ROBUSTO", parse_items_generic_robust(raw)))
     parser_candidates.append(("COORDENADAS", parse_items_by_coordinates(uploaded_file)))
+
+    parser_results = {
+        name: {
+            "items": len(rows or []),
+            "score": score_parsed_items(rows or []),
+        }
+        for name, rows in parser_candidates
+    }
 
     best_name, best_items = max(
         parser_candidates,
@@ -2480,17 +2673,21 @@ def parse_supplier_pdf(uploaded_file):
     currency = "USD" if re.search(r"\bUSD\b|US\$|U\$S|D[ÓO]LAR", raw, re.I) else "PYG"
     doc_type = detect_document_type(raw)
 
+    parsed_total = sum(float(x.get("subtotal", 0) or 0) for x in clean_items)
+    document_total = parsed_total if parsed_total > 0 else extract_doc_total(raw)
+
     meta = {
         "tipo_documento": doc_type,
         "proveedor_sugerido": supplier,
         "numero_documento": extract_doc_number(raw, uploaded_file.name),
         "fecha": extract_doc_date(raw),
         "moneda": currency,
-        "total": extract_doc_total(raw),
+        "total": document_total,
         "archivo_nombre": uploaded_file.name,
         "texto_extraido": raw,
         "calidad_texto": quality,
         "parser_usado": best_name,
+        "resultado_parsers": parser_results,
         "requiere_ocr": bool(quality.get("parece_escaneado")),
         "items_detectados": len(clean_items),
     }
@@ -3233,11 +3430,11 @@ elif page == "🏷️ Stock":
 
 
 # ============================================================
-# COMPRAS / OCR V3.9.4
+# COMPRAS / OCR V3.9.5
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.9.4: además del texto, reconstruye tablas por coordenadas X/Y para facturas y presupuestos con layout complejo.")
+    st.success("V3.9.5: lectura validada con parsers específicos. CCP y Tecno Electric se reconocen por su formato real; los PDF escaneados quedan separados para OCR.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -3266,8 +3463,8 @@ elif page == "🔎 Compras / OCR":
                     quality = meta.get("calidad_texto") or {}
                     if meta.get("requiere_ocr"):
                         st.warning(
-                            "⚠️ Este PDF parece escaneado o tiene muy poco texto digital. "
-                            "La app no inventará materiales: queda marcado como REQUIERE OCR / REVISIÓN."
+                            "⚠️ PDF de imagen / escaneado: no hay texto digital suficiente. "
+                            "No se crearán materiales automáticamente. Estado: REQUIERE OCR DE IMAGEN."
                         )
                     else:
                         st.caption(
@@ -3317,6 +3514,7 @@ elif page == "🔎 Compras / OCR":
                             "Tipo detectado": meta.get("tipo_documento"),
                             "Proveedor sugerido": meta.get("proveedor_sugerido") or "No identificado",
                             "Parser elegido": meta.get("parser_usado"),
+                            "Resultado por parser": meta.get("resultado_parsers", {}),
                             "Ítems válidos": meta.get("items_detectados", len(parsed_items)),
                             "Requiere OCR": meta.get("requiere_ocr", False),
                             "Modo posicional disponible": fitz is not None,
@@ -3331,7 +3529,7 @@ elif page == "🔎 Compras / OCR":
 
                     parsed_items = enrich_items_for_catalog(parsed_items, supplier_row_id_for_preview, currency)
                     st.markdown("#### Validar ítems")
-                    st.caption("V3.9.4: usa texto + posición visual de columnas. Si la factura tiene capa de texto, intenta reconstruir las filas aunque el orden del texto sea complejo.")
+                    st.caption("V3.9.5: el diagnóstico muestra cuántos ítems encontró cada parser y solo acepta filas que pasan validación cantidad × precio ≈ subtotal.")
                     comparison_df = purchase_comparison_summary(parsed_items)
                     if not comparison_df.empty:
                         st.markdown("##### 💰 Comparador de precios")
@@ -3834,6 +4032,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9.4 Lector PDF por coordenadas</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9.5 Lectura validada por proveedor</div>',
     unsafe_allow_html=True,
 )
