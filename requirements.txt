@@ -4,3 +4,4 @@ openpyxl
 supabase
 reportlab
 pypdf
+pymupdf
