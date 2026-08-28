@@ -33,7 +33,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.10.0 - Reparación histórica asistida"
+APP_VERSION = "3.10.1 - Revisión histórica segura"
 
 
 st.markdown("""
@@ -3089,6 +3089,49 @@ def document_original_total_is_suspicious(value):
     return v <= 0 or v > 100_000_000_000
 
 
+
+def assess_recovered_items_quality(items_df):
+    """Evalúa si los ítems recuperados tienen datos suficientes para reparar."""
+    if items_df is None or items_df.empty:
+        return {
+            "usable": False,
+            "valid_rows": 0,
+            "bad_rows": 0,
+            "missing_price_rows": 0,
+            "reason": "Sin ítems",
+        }
+
+    valid_rows = 0
+    bad_rows = 0
+    missing_price_rows = 0
+
+    for _, r in items_df.iterrows():
+        qty = float(r.get("cantidad", 0) or 0)
+        price = parse_money(r.get("precio_unitario", 0))
+        desc = clean_display_value(r.get("descripcion"))
+
+        if qty > 0 and price > 0 and desc:
+            valid_rows += 1
+        else:
+            bad_rows += 1
+            if price <= 0:
+                missing_price_rows += 1
+
+    usable = valid_rows == len(items_df) and len(items_df) > 0
+    reason = "OK" if usable else (
+        f"{bad_rows} fila(s) incompleta(s); "
+        f"{missing_price_rows} sin precio válido"
+    )
+
+    return {
+        "usable": usable,
+        "valid_rows": valid_rows,
+        "bad_rows": bad_rows,
+        "missing_price_rows": missing_price_rows,
+        "reason": reason,
+    }
+
+
 def recovered_document_summary(document_row, items_df):
     if hasattr(document_row, "to_dict"):
         document_row = document_row.to_dict()
@@ -3746,7 +3789,7 @@ elif page == "🏷️ Stock":
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.10.0: diagnostica y repara cargas históricas corruptas sin modificar todavía el historial de precios.")
+    st.success("V3.10.1: revisión histórica segura. No inventa precios; exige completar los ítems antes de reparar o aprobar.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -4005,6 +4048,10 @@ elif page == "🔎 Compras / OCR":
 
                 items=fetch_purchase_document_items(doc_id, row)
                 st.markdown("#### Ítems")
+                st.caption(
+                    "En documentos históricos, corregí principalmente **Cantidad** y **Precio unitario**. "
+                    "El subtotal se calcula de forma segura como Cantidad × Precio."
+                )
                 if items.empty:
                     st.warning("No encontré ítems asociados ni información suficiente para recuperarlos del historial.")
                     items=pd.DataFrame(columns=["id","orden","codigo_proveedor","descripcion","marca","modelo","cantidad","unidad","precio_unitario","subtotal","material_id","confirmado"])
@@ -4017,26 +4064,43 @@ elif page == "🔎 Compras / OCR":
                 edited_items=st.data_editor(items[edit_cols],hide_index=True,use_container_width=True,num_rows="dynamic",key=f"m_items_{doc_id}",disabled=[c for c in ["id","material_id"] if c in edit_cols],column_config={"descripcion":st.column_config.TextColumn("Descripción",width="large"),"precio_unitario":st.column_config.NumberColumn("Precio unit.",format="%.0f"),"subtotal":st.column_config.NumberColumn("Subtotal",format="%.0f"),"confirmado":st.column_config.CheckboxColumn("Activo")})
                 total_calc=0.0
                 suspicious_rows=[]
+                invalid_item_rows=[]
                 if edited_items is not None and not edited_items.empty:
                     for idx_row, rr in edited_items.iterrows():
                         qty=float(rr.get("cantidad",0) or 0)
                         price=safe_money(rr.get("precio_unitario",0))
-                        subtotal=safe_money(rr.get("subtotal",0))
                         expected=qty * price if qty > 0 and price > 0 else 0
-                        if subtotal <= 0 or looks_like_absurd_money(subtotal, expected if expected > 0 else None):
-                            subtotal=expected
+
+                        # En revisión histórica, el subtotal siempre se deriva de Cantidad × Precio.
+                        # Esto evita reutilizar subtotales antiguos ya corruptos.
+                        subtotal = expected
+
+                        if qty <= 0 or price <= 0:
+                            invalid_item_rows.append(str(idx_row))
+                        if subtotal <= 0:
                             suspicious_rows.append(str(idx_row))
                         total_calc += subtotal
-                st.metric("Total recalculado",pyg(total_calc))
+
+                quality = assess_recovered_items_quality(edited_items)
+
+                if quality["usable"]:
+                    st.metric("Total calculado desde ítems",pyg(total_calc))
+                else:
+                    st.metric("Total calculado desde ítems","Pendiente")
+                    st.error(
+                        "⛔ Los ítems históricos recuperados no son suficientes para reconstruir este documento. "
+                        f"{quality['reason']}. Completá manualmente Cantidad y Precio unitario antes de reparar."
+                    )
 
                 repair_summary = recovered_document_summary(row, edited_items)
                 original_total = repair_summary["total_bd"]
                 total_mismatch = False
+                repair_ready = bool(quality["usable"] and total_calc > 0 and not looks_like_absurd_money(total_calc))
 
                 st.markdown("#### 🧰 Diagnóstico histórico")
                 d1,d2,d3,d4 = st.columns(4)
                 d1.metric("Total en BD", pyg(repair_summary["total_bd"]))
-                d2.metric("Total reconstruido", pyg(repair_summary["total_reconstruido"]))
+                d2.metric("Total revisado", pyg(total_calc) if repair_ready else "Pendiente")
                 d3.metric("Ítems", repair_summary["items"])
                 d4.metric("Origen", "Historial" if repair_summary["items_recuperados_historial"] else "Detalle")
 
@@ -4056,25 +4120,22 @@ elif page == "🔎 Compras / OCR":
                         )
                     else:
                         st.success(f"✅ Total validado contra el original: {pyg(original_total)}")
-                elif repair_summary["total_bd_sospechoso"] and total_calc > 0:
+                elif repair_summary["total_bd_sospechoso"]:
                     st.info(
                         "ℹ️ El total histórico no se usa como referencia porque fue marcado como sospechoso. "
-                        "La reparación se basará en los ítems que revises."
+                        "Solo se podrá reparar cuando todos los ítems tengan Cantidad y Precio unitario válidos."
                     )
 
-                if suspicious_rows:
+                if invalid_item_rows:
                     st.warning(
-                        f"⚠️ Se corrigieron automáticamente {len(suspicious_rows)} importe(s) sospechoso(s) "
-                        "usando Cantidad × Precio unitario."
+                        f"⚠️ Hay {len(invalid_item_rows)} fila(s) que todavía necesitan corrección manual. "
+                        "El sistema no inventará precios ni subtotales."
                     )
 
                 b1,b2,b3,b4=st.columns(4)
                 if b1.button("💾 Guardar correcciones",use_container_width=True,key=f"m_save_{doc_id}"):
                     if looks_like_absurd_money(total_calc):
                         st.error("El total calculado es inválido o demasiado grande. Revisá cantidades y precios.")
-                        st.stop()
-                    if total_mismatch:
-                        st.error("No se guardó: el total de los ítems no coincide con el total original del documento.")
                         st.stop()
                     sid=row.get("proveedor_id")
                     if suppliers_admin is not None and not suppliers_admin.empty:
@@ -4087,8 +4148,15 @@ elif page == "🔎 Compras / OCR":
                     except Exception as exc:
                         st.error(f"No se pudo guardar: {exc}")
                 if b2.button("✅ Aprobar",use_container_width=True,key=f"m_ok_{doc_id}"):
-                    if total_mismatch:
-                        st.error("No se puede aprobar: primero corregí los ítems hasta que el total coincida.")
+                    if not repair_ready:
+                        st.error(
+                            "No se puede aprobar todavía. Completá todos los precios/cantidades "
+                            "y aplicá la reparación histórica primero."
+                        )
+                    elif repair_summary["total_bd_sospechoso"]:
+                        st.error("Primero aplicá la reparación histórica para reemplazar el total corrupto.")
+                    elif total_mismatch:
+                        st.error("No se puede aprobar: el total revisado no coincide con el documento.")
                     else:
                         try:
                             set_document_review_status(doc_id,"Revisado")
@@ -4137,10 +4205,13 @@ elif page == "🔎 Compras / OCR":
                 ):
                     if not confirm_repair:
                         st.error("Marcá la confirmación antes de reparar.")
-                    elif total_calc <= 0:
-                        st.error("El total reconstruido debe ser mayor a cero.")
-                    elif looks_like_absurd_money(total_calc):
-                        st.error("El total reconstruido sigue siendo inválido. Revisá los ítems.")
+                    elif not quality["usable"]:
+                        st.error(
+                            "No se puede reparar todavía: hay ítems sin cantidad o precio válido. "
+                            "Completalos en la tabla."
+                        )
+                    elif total_calc <= 0 or looks_like_absurd_money(total_calc):
+                        st.error("El total calculado sigue siendo inválido. Revisá los ítems.")
                     else:
                         try:
                             apply_repair_to_document(doc_id, edited_items, total_calc, repair_note)
@@ -4535,6 +4606,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.10.0 Reparación histórica asistida</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.10.1 Revisión histórica segura</div>',
     unsafe_allow_html=True,
 )
