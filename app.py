@@ -33,7 +33,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.9.9 - Valores históricos confiables"
+APP_VERSION = "3.10.0 - Reparación histórica asistida"
 
 
 st.markdown("""
@@ -3083,6 +3083,56 @@ def save_purchase_document(meta, items_df, supplier_id, auto_create_materials=Tr
     return doc_id, len(rows)
 
 
+
+def document_original_total_is_suspicious(value):
+    v = parse_money(value)
+    return v <= 0 or v > 100_000_000_000
+
+
+def recovered_document_summary(document_row, items_df):
+    if hasattr(document_row, "to_dict"):
+        document_row = document_row.to_dict()
+
+    original_total = parse_money(document_row.get("total", 0))
+    reconstructed_total = 0.0
+
+    if items_df is not None and not items_df.empty:
+        for _, r in items_df.iterrows():
+            qty = float(r.get("cantidad", 0) or 0)
+            price = parse_money(r.get("precio_unitario", 0))
+            subtotal = parse_money(r.get("subtotal", 0))
+            if subtotal <= 0:
+                subtotal = qty * price
+            reconstructed_total += subtotal
+
+    recovered = bool(
+        items_df is not None
+        and not items_df.empty
+        and "_recuperado_historial" in items_df.columns
+        and items_df["_recuperado_historial"].fillna(False).any()
+    )
+
+    return {
+        "total_bd": original_total,
+        "total_reconstruido": reconstructed_total,
+        "total_bd_sospechoso": document_original_total_is_suspicious(original_total),
+        "items": 0 if items_df is None else len(items_df),
+        "items_recuperados_historial": recovered,
+    }
+
+
+def apply_repair_to_document(document_id, edited_items, corrected_total, note=None):
+    update_purchase_document_items(document_id, edited_items)
+    payload = {
+        "total": float(corrected_total or 0),
+        "estado_revision": "Pendiente de revisión",
+        "aprobado": False,
+    }
+    if note is not None:
+        payload["observacion"] = clean_display_value(note) or None
+    return update_purchase_document_header(document_id, payload)
+
+
 def fetch_purchase_documents():
     try:
         data=supabase.table("documentos_compra").select("*").order("creado_en",desc=True).limit(200).execute().data or []
@@ -3696,7 +3746,7 @@ elif page == "🏷️ Stock":
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.9.9: respeta los valores numéricos de Supabase y valida el total reconstruido contra el total original del documento.")
+    st.success("V3.10.0: diagnostica y repara cargas históricas corruptas sin modificar todavía el historial de precios.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -3979,9 +4029,23 @@ elif page == "🔎 Compras / OCR":
                         total_calc += subtotal
                 st.metric("Total recalculado",pyg(total_calc))
 
-                original_total = parse_money(row.get("total", 0))
+                repair_summary = recovered_document_summary(row, edited_items)
+                original_total = repair_summary["total_bd"]
                 total_mismatch = False
-                if original_total > 0 and total_calc > 0:
+
+                st.markdown("#### 🧰 Diagnóstico histórico")
+                d1,d2,d3,d4 = st.columns(4)
+                d1.metric("Total en BD", pyg(repair_summary["total_bd"]))
+                d2.metric("Total reconstruido", pyg(repair_summary["total_reconstruido"]))
+                d3.metric("Ítems", repair_summary["items"])
+                d4.metric("Origen", "Historial" if repair_summary["items_recuperados_historial"] else "Detalle")
+
+                if repair_summary["total_bd_sospechoso"]:
+                    st.warning(
+                        "⚠️ El total almacenado en la base histórica parece corrupto. "
+                        "Podés revisar los ítems y aplicar una reparación asistida."
+                    )
+                if original_total > 0 and total_calc > 0 and not repair_summary["total_bd_sospechoso"]:
                     diff_ratio = abs(total_calc - original_total) / original_total
                     total_mismatch = diff_ratio > 0.15
                     if total_mismatch:
@@ -3992,6 +4056,11 @@ elif page == "🔎 Compras / OCR":
                         )
                     else:
                         st.success(f"✅ Total validado contra el original: {pyg(original_total)}")
+                elif repair_summary["total_bd_sospechoso"] and total_calc > 0:
+                    st.info(
+                        "ℹ️ El total histórico no se usa como referencia porque fue marcado como sospechoso. "
+                        "La reparación se basará en los ítems que revises."
+                    )
 
                 if suspicious_rows:
                     st.warning(
@@ -4042,6 +4111,46 @@ elif page == "🔎 Compras / OCR":
                         st.rerun()
                     except Exception as exc:
                         st.error(f"No se pudo restaurar: {exc}")
+
+                st.markdown("---")
+                st.markdown("#### 🧰 Reparación histórica")
+                st.caption(
+                    "Usá esta opción cuando los datos históricos sean incorrectos. "
+                    "No modifica historial_precios todavía."
+                )
+
+                repair_note = st.text_area(
+                    "Nota de reparación",
+                    value=clean_display_value(row.get("observacion")),
+                    key=f"repair_note_{doc_id}",
+                    placeholder="Ej.: total histórico corrupto; reconstruido desde los ítems revisados."
+                )
+                confirm_repair = st.checkbox(
+                    "Confirmo que revisé cantidades, precios y subtotales",
+                    key=f"confirm_repair_{doc_id}"
+                )
+
+                if st.button(
+                    "🧰 Aplicar reparación histórica",
+                    use_container_width=True,
+                    key=f"repair_doc_{doc_id}"
+                ):
+                    if not confirm_repair:
+                        st.error("Marcá la confirmación antes de reparar.")
+                    elif total_calc <= 0:
+                        st.error("El total reconstruido debe ser mayor a cero.")
+                    elif looks_like_absurd_money(total_calc):
+                        st.error("El total reconstruido sigue siendo inválido. Revisá los ítems.")
+                    else:
+                        try:
+                            apply_repair_to_document(doc_id, edited_items, total_calc, repair_note)
+                            st.success(
+                                "Reparación aplicada. Se guardaron los ítems visibles y se reemplazó "
+                                "el total histórico del documento. El historial de precios no fue modificado."
+                            )
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"No se pudo aplicar la reparación: {exc}")
 
 
 # ============================================================
@@ -4426,6 +4535,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9.9 Valores históricos confiables</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.10.0 Reparación histórica asistida</div>',
     unsafe_allow_html=True,
 )
