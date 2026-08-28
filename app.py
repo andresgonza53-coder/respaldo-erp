@@ -33,7 +33,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.10.4 - Separadores de miles"
+APP_VERSION = "3.10.5 - Tecno Electric corregido"
 
 
 st.markdown("""
@@ -1217,7 +1217,7 @@ SUPPLIER_ALIASES = {
     "ELECTROPAR": ["ELECTROPAR", "ELECTROPAR.COM.PY"],
     "COMAGRO": ["COMAGRO"],
     "CCP": ["PRESUP DIGITAL CH", "PRESUP. DIGITAL CH", "80140053-8", "COMPAÑIA COMERCIAL DEL PARAGUAY", "COMPANIA COMERCIAL DEL PARAGUAY"],
-    "TECNO ELECTRIC": ["TECNOELECTRIC", "TECNO ELECTRIC", "TECNOELECTRIC.ODOO.COM"],
+    "TECNO ELECTRIC": ["TECNOELECTRIC", "TECNO ELECTRIC", "TE TECNO ELECTRIC", "TECNOELECTRIC.ODOO.COM", "TECNOELECTRIC.COM.PY"],
     "RECORD ELECTRIC": ["RECORD ELECTRIC"],
 }
 
@@ -2013,6 +2013,15 @@ def parse_item_numbers_from_tail(line):
 
 def guess_supplier_name(text):
     n = normalize_text(text)
+
+    # Señales inequívocas de Tecno Electric.
+    if (
+        "TECNOELECTRIC.ODOO.COM" in n
+        or "TECNOELECTRIC.COM.PY" in n
+        or ("TM241CE40T" in n and "TOTAL IVA INCLUIDO" in n)
+    ):
+        return "TECNO ELECTRIC"
+
     for canonical, aliases in SUPPLIER_ALIASES.items():
         if any(normalize_text(alias) in n for alias in aliases):
             return canonical
@@ -2023,10 +2032,20 @@ def match_supplier_row(suggested, suppliers_df):
     if suppliers_df is None or suppliers_df.empty:
         return None
     target = normalize_text(suggested)
-    # Coincidencia exacta/contiene.
+    compact_target = re.sub(r"[^A-Z0-9]", "", target)
+
+    # Coincidencia exacta/contiene, también ignorando espacios y signos.
     for _, row in suppliers_df.iterrows():
         name = normalize_text(row.get("nombre", ""))
-        if target and (name == target or target in name or name in target):
+        compact_name = re.sub(r"[^A-Z0-9]", "", name)
+        if target and (
+            name == target
+            or target in name
+            or name in target
+            or (compact_target and compact_name == compact_target)
+            or (compact_target and compact_target in compact_name)
+            or (compact_name and compact_name in compact_target)
+        ):
             return row.to_dict()
     # Alias conocido: CCP puede luego llamarse Compañía Comercial del Paraguay.
     for canonical, aliases in SUPPLIER_ALIASES.items():
@@ -2556,57 +2575,99 @@ def parse_items_comagro(text):
 
 
 def parse_items_tecno(text):
-    """Parser Tecno Electric / Odoo.
+    """Parser específico para cotizaciones Tecno Electric / Odoo.
 
-    Soporta filas como:
-    1
-    [TM241CE40T] M241 PLC ...
-    1 Unidad(es)
-    8.104.881
-    8.104.881 ₲
+    Probado con S14808:
+    - [TM241CE40T] M241 PLC 24E/16ST PNP ETH 24VDC
+    - [TM3DI16] M221/241 MOD TM3 16E
+    - [TM3TI8T] M221/241 MOD TM3 TEMP 8E
+
+    Soporta descripciones partidas en varias líneas.
     """
-    lines = [x.strip() for x in str(text or "").splitlines() if x.strip()]
+    lines = [clean_display_value(x) for x in str(text or "").splitlines()]
+    lines = [x.strip() for x in lines if x and x.strip()]
+
     rows = []
     i = 0
 
     while i < len(lines):
-        m = re.fullmatch(r"(\d+)", lines[i])
-        if m and i + 1 < len(lines) and lines[i + 1].startswith("["):
-            order = int(m.group(1))
-            cm = re.match(r"^\[([^]]+)\]\s*(.+)$", lines[i + 1])
-            if not cm:
-                i += 1
-                continue
+        if not re.fullmatch(r"\d+", lines[i]):
+            i += 1
+            continue
 
-            code = cm.group(1).strip()
-            desc = cm.group(2).strip()
+        order = int(lines[i])
 
-            if i + 4 < len(lines):
-                qm = re.match(r"^(\d+(?:[.,]\d+)?)\s+(.+)$", lines[i + 2])
-                if qm:
-                    qty = parse_money(qm.group(1))
-                    unit = qm.group(2).strip()
-                    price = parse_money(lines[i + 3])
-                    subtotal = parse_money(lines[i + 4])
+        # Un ítem válido debe tener enseguida un código entre corchetes.
+        if i + 1 >= len(lines) or not lines[i + 1].startswith("["):
+            i += 1
+            continue
 
-                    if qty > 0 and price > 0 and subtotal > 0:
-                        expected = qty * price
-                        if expected and abs(subtotal - expected) / expected <= 0.03:
-                            rows.append({
-                                "orden": order,
-                                "codigo_proveedor": code,
-                                "descripcion": desc,
-                                "marca": detect_brand(desc),
-                                "modelo": code,
-                                "cantidad": float(qty),
-                                "unidad": unit,
-                                "precio_unitario": float(price),
-                                "subtotal": float(subtotal),
-                                "confirmado": True,
-                            })
-                            i += 5
-                            continue
-        i += 1
+        first = lines[i + 1]
+        cm = re.match(r"^\[([^\]]+)\]\s*(.*)$", first)
+        if not cm:
+            i += 1
+            continue
+
+        code = cm.group(1).strip()
+        desc_parts = [cm.group(2).strip()] if cm.group(2).strip() else []
+
+        j = i + 2
+
+        # La descripción puede continuar hasta encontrar Cantidad.
+        while j < len(lines):
+            token = lines[j].strip()
+
+            # Cantidad es una línea numérica simple y la siguiente es la unidad.
+            if (
+                re.fullmatch(r"\d+(?:[.,]\d+)?", token)
+                and j + 1 < len(lines)
+                and re.search(r"UNIDAD", normalize_text(lines[j + 1]))
+            ):
+                break
+
+            # Si aparece el siguiente ítem antes de cantidad, abortar este.
+            if re.fullmatch(r"\d+", token) and j + 1 < len(lines) and lines[j + 1].startswith("["):
+                break
+
+            desc_parts.append(token)
+            j += 1
+
+        if j + 3 >= len(lines):
+            i += 1
+            continue
+
+        qty = parse_money(lines[j])
+        unit = lines[j + 1].strip()
+        price = parse_money(lines[j + 2])
+        subtotal = parse_money(lines[j + 3])
+
+        # A veces el símbolo ₲ viene en una línea separada: no afecta.
+        description = " ".join(desc_parts)
+        description = re.sub(r"\s+", " ", description).strip()
+
+        if qty <= 0 or price <= 0 or subtotal <= 0 or not description:
+            i += 1
+            continue
+
+        expected = qty * price
+        if expected > 0 and abs(subtotal - expected) / expected > 0.02:
+            i += 1
+            continue
+
+        rows.append({
+            "orden": order,
+            "codigo_proveedor": code,
+            "descripcion": description,
+            "marca": "SCHNEIDER ELECTRIC",
+            "modelo": code,
+            "cantidad": float(qty),
+            "unidad": "Unidad(es)",
+            "precio_unitario": float(price),
+            "subtotal": float(subtotal),
+            "confirmado": True,
+        })
+
+        i = j + 4
 
     return rows
 
@@ -4008,7 +4069,7 @@ elif page == "🏷️ Stock":
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.10.4: los importes en guaraníes ahora se muestran con separador de miles para facilitar la carga y revisión.")
+    st.success("V3.10.5: corrige Tecno Electric: proveedor, descripciones multilínea, marca Schneider Electric y modelos/referencias.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -5016,6 +5077,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.10.4 Separadores de miles</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.10.5 Tecno Electric corregido</div>',
     unsafe_allow_html=True,
 )
