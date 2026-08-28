@@ -33,7 +33,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.10.1 - Revisión histórica segura"
+APP_VERSION = "3.10.2 - Eliminación segura de documentos"
 
 
 st.markdown("""
@@ -3176,6 +3176,121 @@ def apply_repair_to_document(document_id, edited_items, corrected_total, note=No
     return update_purchase_document_header(document_id, payload)
 
 
+
+def delete_purchase_document(document_id, document_row=None, delete_price_history=True):
+    """Elimina un documento de compra y sus datos dependientes.
+
+    NO elimina proveedores ni materiales del catálogo.
+
+    Si delete_price_history=True, también elimina del historial de precios las
+    filas vinculadas específicamente al documento mediante:
+    proveedor + fecha + texto "Documento <número>" en observación.
+    """
+    if not document_id:
+        raise ValueError("Documento inválido.")
+
+    if document_row is None:
+        rows = (
+            supabase.table("documentos_compra")
+            .select("*")
+            .eq("id", document_id)
+            .limit(1)
+            .execute()
+            .data or []
+        )
+        document_row = rows[0] if rows else {}
+
+    if hasattr(document_row, "to_dict"):
+        document_row = document_row.to_dict()
+
+    supplier_id = document_row.get("proveedor_id")
+    number = clean_display_value(document_row.get("numero_documento"))
+    doc_date = clean_display_value(document_row.get("fecha"))[:10]
+
+    deleted_history = 0
+    deleted_items = 0
+
+    # 1) Historial de precios generado por este documento.
+    if delete_price_history and supplier_id and number:
+        try:
+            q = (
+                supabase.table("historial_precios")
+                .select("id,observacion")
+                .eq("proveedor_id", supplier_id)
+            )
+            if doc_date:
+                q = q.eq("fecha", doc_date)
+
+            candidates = q.limit(1000).execute().data or []
+            needle = normalize_text(f"DOCUMENTO {number}")
+
+            ids = [
+                r.get("id")
+                for r in candidates
+                if r.get("id") and needle in normalize_text(r.get("observacion", ""))
+            ]
+
+            for hist_id in ids:
+                supabase.table("historial_precios").delete().eq("id", hist_id).execute()
+                deleted_history += 1
+        except Exception as exc:
+            raise RuntimeError(
+                f"No se pudo limpiar el historial de precios del documento {number}: {exc}"
+            )
+
+    # 2) Ítems del documento.
+    try:
+        existing_items = (
+            supabase.table("documentos_compra_items")
+            .select("id")
+            .eq("documento_id", document_id)
+            .execute()
+            .data or []
+        )
+        deleted_items = len(existing_items)
+        supabase.table("documentos_compra_items").delete().eq("documento_id", document_id).execute()
+    except Exception as exc:
+        raise RuntimeError(f"No se pudieron eliminar los ítems: {exc}")
+
+    # 3) Encabezado del documento.
+    try:
+        supabase.table("documentos_compra").delete().eq("id", document_id).execute()
+    except Exception as exc:
+        raise RuntimeError(f"No se pudo eliminar el documento: {exc}")
+
+    return {
+        "documento": number,
+        "items_eliminados": deleted_items,
+        "precios_eliminados": deleted_history,
+    }
+
+
+def delete_purchase_documents_bulk(document_rows, delete_price_history=True):
+    """Elimina varios documentos de manera secuencial y devuelve resumen."""
+    results = []
+    errors = []
+
+    for row in document_rows:
+        try:
+            if hasattr(row, "to_dict"):
+                row = row.to_dict()
+            result = delete_purchase_document(
+                row.get("id"),
+                row,
+                delete_price_history=delete_price_history,
+            )
+            results.append(result)
+        except Exception as exc:
+            errors.append({
+                "numero_documento": clean_display_value(
+                    row.get("numero_documento") if isinstance(row, dict) else ""
+                ),
+                "error": str(exc),
+            })
+
+    return results, errors
+
+
 def fetch_purchase_documents():
     try:
         data=supabase.table("documentos_compra").select("*").order("creado_en",desc=True).limit(200).execute().data or []
@@ -3789,7 +3904,7 @@ elif page == "🏷️ Stock":
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.10.1: revisión histórica segura. No inventa precios; exige completar los ítems antes de reparar o aprobar.")
+    st.success("V3.10.2: permite eliminar definitivamente documentos, sus ítems y opcionalmente sus precios históricos vinculados.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -3995,7 +4110,7 @@ elif page == "🔎 Compras / OCR":
 
     with tab_history:
         st.subheader("Documentos importados")
-        st.caption("La persona de carga puede subir documentos; después podés corregirlos, aprobarlos, anularlos o restaurarlos.")
+        st.caption("La persona de carga puede subir documentos; después podés corregirlos, aprobarlos, anularlos, restaurarlos o eliminarlos.")
         docs=fetch_purchase_documents()
         if docs.empty:
             st.info("Todavía no hay documentos importados.")
@@ -4028,6 +4143,75 @@ elif page == "🔎 Compras / OCR":
             st.dataframe(filtered[cols],hide_index=True,use_container_width=True,column_config={"total":st.column_config.NumberColumn("Total",format="%.0f"),"tipo_documento":"Tipo","numero_documento":"Nº documento","estado_revision":"Estado","archivo_nombre":"Archivo"})
 
             if not filtered.empty:
+                with st.expander("🗑️ Eliminar varios documentos", expanded=False):
+                    bulk_options = {
+                        f"{clean_display_value(r.get('Proveedor'))} · {clean_display_value(r.get('tipo_documento'))} "
+                        f"{clean_display_value(r.get('numero_documento'))} · {clean_display_value(r.get('fecha'))}": str(r.get("id"))
+                        for _, r in filtered.iterrows()
+                    }
+
+                    selected_bulk = st.multiselect(
+                        "Seleccionar documentos a eliminar",
+                        list(bulk_options.keys()),
+                        key="bulk_delete_documents"
+                    )
+
+                    bulk_delete_prices = st.checkbox(
+                        "Eliminar también los precios históricos vinculados a esos documentos",
+                        value=True,
+                        key="bulk_delete_prices"
+                    )
+
+                    confirm_bulk = st.checkbox(
+                        "Confirmo que quiero eliminar definitivamente los documentos seleccionados",
+                        key="bulk_delete_confirm"
+                    )
+
+                    if st.button(
+                        "🗑️ Eliminar seleccionados definitivamente",
+                        type="primary",
+                        use_container_width=True,
+                        key="bulk_delete_button"
+                    ):
+                        if not selected_bulk:
+                            st.error("Seleccioná al menos un documento.")
+                        elif not confirm_bulk:
+                            st.error("Marcá la confirmación de eliminación.")
+                        else:
+                            selected_ids = {bulk_options[label] for label in selected_bulk}
+                            rows_to_delete = [
+                                r.to_dict()
+                                for _, r in filtered.iterrows()
+                                if str(r.get("id")) in selected_ids
+                            ]
+                            results, errors = delete_purchase_documents_bulk(
+                                rows_to_delete,
+                                delete_price_history=bulk_delete_prices
+                            )
+
+                            if results:
+                                docs_deleted = ", ".join(
+                                    clean_display_value(r.get("documento")) for r in results
+                                )
+                                total_items = sum(int(r.get("items_eliminados", 0)) for r in results)
+                                total_prices = sum(int(r.get("precios_eliminados", 0)) for r in results)
+                                st.success(
+                                    f"Eliminados: {docs_deleted}. "
+                                    f"Ítems eliminados: {total_items}. "
+                                    f"Precios históricos eliminados: {total_prices}."
+                                )
+
+                            if errors:
+                                st.error(
+                                    "Algunos documentos no pudieron eliminarse: "
+                                    + " | ".join(
+                                        f"{e.get('numero_documento')}: {e.get('error')}"
+                                        for e in errors
+                                    )
+                                )
+                            else:
+                                st.rerun()
+
                 options={f"{clean_display_value(r.get('Proveedor'))} · {clean_display_value(r.get('tipo_documento'))} {clean_display_value(r.get('numero_documento'))} · {clean_display_value(r.get('fecha'))}":str(r.get("id")) for _,r in filtered.iterrows()}
                 label=st.selectbox("Abrir documento",list(options.keys()))
                 doc_id=options[label]
@@ -4179,6 +4363,49 @@ elif page == "🔎 Compras / OCR":
                         st.rerun()
                     except Exception as exc:
                         st.error(f"No se pudo restaurar: {exc}")
+
+                st.markdown("---")
+                with st.expander("🗑️ Eliminar este documento definitivamente", expanded=False):
+                    st.warning(
+                        "Esta acción elimina el documento y sus ítems. "
+                        "No elimina el proveedor ni los materiales del catálogo."
+                    )
+
+                    delete_prices = st.checkbox(
+                        "Eliminar también los precios históricos vinculados a este documento",
+                        value=True,
+                        key=f"delete_prices_{doc_id}"
+                    )
+
+                    confirm_number = st.text_input(
+                        f"Para confirmar, escribí el Nº de documento: {clean_display_value(row.get('numero_documento'))}",
+                        key=f"delete_confirm_number_{doc_id}"
+                    )
+
+                    if st.button(
+                        "🗑️ Eliminar definitivamente",
+                        type="primary",
+                        use_container_width=True,
+                        key=f"delete_document_{doc_id}"
+                    ):
+                        expected_number = clean_display_value(row.get("numero_documento"))
+                        if confirm_number.strip() != expected_number:
+                            st.error("El número escrito no coincide. No se eliminó nada.")
+                        else:
+                            try:
+                                result = delete_purchase_document(
+                                    doc_id,
+                                    row,
+                                    delete_price_history=delete_prices
+                                )
+                                st.success(
+                                    f"Documento {result.get('documento')} eliminado. "
+                                    f"Ítems: {result.get('items_eliminados', 0)} · "
+                                    f"Precios históricos: {result.get('precios_eliminados', 0)}."
+                                )
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"No se pudo eliminar: {exc}")
 
                 st.markdown("---")
                 st.markdown("#### 🧰 Reparación histórica")
@@ -4606,6 +4833,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.10.1 Revisión histórica segura</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.10.2 Eliminación segura de documentos</div>',
     unsafe_allow_html=True,
 )
