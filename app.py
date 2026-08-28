@@ -33,7 +33,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.9.6 - Gestión de documentos"
+APP_VERSION = "3.9.7 - Recuperación de ítems históricos"
 
 
 st.markdown("""
@@ -1209,28 +1209,159 @@ def clean_display_value(value):
     return "" if text.lower() in {"nan", "none", "nat"} else text
 
 
-def fetch_purchase_document_items(document_id):
+def fetch_purchase_document_items(document_id, document_row=None):
+    """Lee los ítems guardados del documento.
+
+    Compatibilidad histórica:
+    algunas cargas antiguas guardaron encabezado + historial de precios,
+    pero no dejaron filas en documentos_compra_items. Si ocurre eso,
+    reconstruimos los ítems desde historial_precios para que puedan revisarse
+    y, al guardar, queden materializados en documentos_compra_items.
+    """
     try:
-        rows=(supabase.table("documentos_compra_items").select("*").eq("documento_id",document_id).order("orden").execute().data or [])
-        return pd.DataFrame(rows)
+        rows = (
+            supabase.table("documentos_compra_items")
+            .select("*")
+            .eq("documento_id", document_id)
+            .order("orden")
+            .execute()
+            .data or []
+        )
+        if rows:
+            return pd.DataFrame(rows)
     except Exception:
+        pass
+
+    if document_row is None:
+        try:
+            docs = (
+                supabase.table("documentos_compra")
+                .select("*")
+                .eq("id", document_id)
+                .limit(1)
+                .execute()
+                .data or []
+            )
+            document_row = docs[0] if docs else None
+        except Exception:
+            document_row = None
+
+    if document_row is None:
         return pd.DataFrame()
+
+    # document_row puede ser Series de pandas o dict
+    if hasattr(document_row, "to_dict"):
+        document_row = document_row.to_dict()
+
+    supplier_id = document_row.get("proveedor_id")
+    number = clean_display_value(document_row.get("numero_documento"))
+    doc_date = clean_display_value(document_row.get("fecha"))
+
+    if not supplier_id or not number:
+        return pd.DataFrame()
+
+    try:
+        q = (
+            supabase.table("historial_precios")
+            .select("id,material_id,proveedor_id,precio,moneda,fecha,fuente,observacion,registrado_por")
+            .eq("proveedor_id", supplier_id)
+        )
+        if doc_date:
+            q = q.eq("fecha", doc_date[:10])
+
+        history = q.order("fecha", desc=True).limit(500).execute().data or []
+    except Exception:
+        history = []
+
+    if not history:
+        return pd.DataFrame()
+
+    # Solo registros que pertenecen al documento.
+    needle = normalize_text(f"DOCUMENTO {number}")
+    matched = [
+        h for h in history
+        if needle in normalize_text(h.get("observacion", ""))
+    ]
+    if not matched:
+        return pd.DataFrame()
+
+    mats = fetch_materials()
+    mat_map = {}
+    if mats is not None and not mats.empty:
+        for _, m in mats.iterrows():
+            mat_map[str(m.get("id"))] = {
+                "nombre": clean_display_value(m.get("nombre")),
+                "marca": clean_display_value(m.get("marca")),
+                "modelo": clean_display_value(m.get("modelo")),
+                "descripcion": clean_display_value(m.get("descripcion")),
+            }
+
+    recovered = []
+    for order, h in enumerate(matched, start=1):
+        obs = clean_display_value(h.get("observacion"))
+        qty = 1.0
+        subtotal = 0.0
+
+        mq = re.search(r"Cantidad\s+([0-9.,]+)", obs, flags=re.I)
+        if mq:
+            try:
+                qty = float(str(mq.group(1)).replace(",", "."))
+            except Exception:
+                qty = 1.0
+
+        ms = re.search(r"Subtotal\s+([0-9.,]+)", obs, flags=re.I)
+        if ms:
+            subtotal = parse_money(ms.group(1))
+
+        price = float(h.get("precio", 0) or 0)
+        if subtotal <= 0 and price > 0:
+            subtotal = qty * price
+
+        mid = h.get("material_id")
+        mat = mat_map.get(str(mid), {})
+
+        recovered.append({
+            "id": None,
+            "documento_id": document_id,
+            "orden": order,
+            "codigo_proveedor": "",
+            "descripcion": mat.get("descripcion") or mat.get("nombre") or "Material histórico",
+            "marca": mat.get("marca") or "",
+            "modelo": mat.get("modelo") or "",
+            "cantidad": qty,
+            "unidad": "und",
+            "precio_unitario": price,
+            "subtotal": subtotal,
+            "material_id": mid,
+            "confirmado": True,
+            "_recuperado_historial": True,
+        })
+
+    return pd.DataFrame(recovered)
+
+
 
 def save_document_corrections(document_id, header_payload, items_df=None):
     supabase.table("documentos_compra").update(header_payload).eq("id",document_id).execute()
     if items_df is not None and not items_df.empty:
         for _,r in items_df.iterrows():
             rid=clean_display_value(r.get("id"))
+            qty=float(r.get("cantidad",0) or 0)
+            price=float(r.get("precio_unitario",0) or 0)
+            subtotal=float(r.get("subtotal",0) or 0)
+            if subtotal <= 0 and qty > 0 and price > 0:
+                subtotal = qty * price
+
             payload={
                 "orden":int(r.get("orden",0) or 0),
                 "codigo_proveedor":clean_display_value(r.get("codigo_proveedor")) or None,
                 "descripcion":clean_display_value(r.get("descripcion")) or None,
                 "marca":clean_display_value(r.get("marca")) or None,
                 "modelo":clean_display_value(r.get("modelo")) or None,
-                "cantidad":float(r.get("cantidad",0) or 0),
+                "cantidad":qty,
                 "unidad":clean_display_value(r.get("unidad")) or "und",
-                "precio_unitario":float(r.get("precio_unitario",0) or 0),
-                "subtotal":float(r.get("subtotal",0) or 0),
+                "precio_unitario":price,
+                "subtotal":subtotal,
                 "confirmado":bool(r.get("confirmado",True)),
                 "material_id":clean_display_value(r.get("material_id")) or None,
             }
@@ -3479,7 +3610,7 @@ elif page == "🏷️ Stock":
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.9.6: además de importar, ahora podés revisar, corregir, aprobar, anular y restaurar documentos cargados.")
+    st.success("V3.9.7: además de editar documentos, recupera ítems de cargas antiguas desde el historial de precios cuando faltan en el detalle.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -3736,13 +3867,26 @@ elif page == "🔎 Compras / OCR":
                 currency=c5.selectbox("Moneda",["PYG","USD"],index=0 if clean_display_value(row.get("moneda"))!="USD" else 1,key=f"m_cur_{doc_id}")
                 obs=c6.text_area("Observación",value=clean_display_value(row.get("observacion")),key=f"m_obs_{doc_id}")
 
-                items=fetch_purchase_document_items(doc_id)
+                items=fetch_purchase_document_items(doc_id, row)
                 st.markdown("#### Ítems")
                 if items.empty:
+                    st.warning("No encontré ítems asociados ni información suficiente para recuperarlos del historial.")
                     items=pd.DataFrame(columns=["id","orden","codigo_proveedor","descripcion","marca","modelo","cantidad","unidad","precio_unitario","subtotal","material_id","confirmado"])
+                elif "_recuperado_historial" in items.columns and items["_recuperado_historial"].fillna(False).any():
+                    st.info(
+                        "♻️ Ítems recuperados del historial de precios de una carga antigua. "
+                        "Revisalos y presioná **Guardar correcciones** para dejarlos vinculados permanentemente a este documento."
+                    )
                 edit_cols=[c for c in ["id","orden","codigo_proveedor","descripcion","marca","modelo","cantidad","unidad","precio_unitario","subtotal","material_id","confirmado"] if c in items.columns]
                 edited_items=st.data_editor(items[edit_cols],hide_index=True,use_container_width=True,num_rows="dynamic",key=f"m_items_{doc_id}",disabled=[c for c in ["id","material_id"] if c in edit_cols],column_config={"descripcion":st.column_config.TextColumn("Descripción",width="large"),"precio_unitario":st.column_config.NumberColumn("Precio unit.",format="%.0f"),"subtotal":st.column_config.NumberColumn("Subtotal",format="%.0f"),"confirmado":st.column_config.CheckboxColumn("Activo")})
-                total_calc=float(pd.to_numeric(edited_items.get("subtotal",pd.Series(dtype=float)),errors="coerce").fillna(0).sum()) if edited_items is not None else 0
+                if edited_items is not None and not edited_items.empty:
+                    subt = pd.to_numeric(edited_items.get("subtotal",pd.Series(index=edited_items.index,dtype=float)),errors="coerce")
+                    qtys = pd.to_numeric(edited_items.get("cantidad",pd.Series(index=edited_items.index,dtype=float)),errors="coerce").fillna(0)
+                    prices = pd.to_numeric(edited_items.get("precio_unitario",pd.Series(index=edited_items.index,dtype=float)),errors="coerce").fillna(0)
+                    subt = subt.where(subt.fillna(0) > 0, qtys * prices).fillna(0)
+                    total_calc=float(subt.sum())
+                else:
+                    total_calc=0
                 st.metric("Total recalculado",pyg(total_calc))
 
                 b1,b2,b3,b4=st.columns(4)
@@ -4163,6 +4307,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9.6 Gestión de documentos</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9.7 Recuperación de ítems históricos</div>',
     unsafe_allow_html=True,
 )
