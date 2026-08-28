@@ -33,7 +33,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.10.5 - Tecno Electric corregido"
+APP_VERSION = "3.10.6 - Proveedor PDF corregido"
 
 
 st.markdown("""
@@ -2031,22 +2031,29 @@ def guess_supplier_name(text):
 def match_supplier_row(suggested, suppliers_df):
     if suppliers_df is None or suppliers_df.empty:
         return None
+
     target = normalize_text(suggested)
     compact_target = re.sub(r"[^A-Z0-9]", "", target)
 
-    # Coincidencia exacta/contiene, también ignorando espacios y signos.
+    # Alias compactos conocidos.
+    alias_targets = {compact_target}
+    if "TECNOELECTRIC" in compact_target:
+        alias_targets.update({"TECNOELECTRIC", "TECNOELECTRICSRL"})
+
     for _, row in suppliers_df.iterrows():
         name = normalize_text(row.get("nombre", ""))
         compact_name = re.sub(r"[^A-Z0-9]", "", name)
+
         if target and (
             name == target
             or target in name
             or name in target
-            or (compact_target and compact_name == compact_target)
-            or (compact_target and compact_target in compact_name)
-            or (compact_name and compact_name in compact_target)
+            or compact_name in alias_targets
+            or any(a and (a in compact_name or compact_name in a) for a in alias_targets)
         ):
             return row.to_dict()
+
+    return None
     # Alias conocido: CCP puede luego llamarse Compañía Comercial del Paraguay.
     for canonical, aliases in SUPPLIER_ALIASES.items():
         if target == normalize_text(canonical):
@@ -4069,7 +4076,7 @@ elif page == "🏷️ Stock":
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.10.5: corrige Tecno Electric: proveedor, descripciones multilínea, marca Schneider Electric y modelos/referencias.")
+    st.success("V3.10.6: corrige la selección del proveedor del PDF y evita que una selección anterior de Streamlit lo cambie a CCP.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -4109,7 +4116,17 @@ elif page == "🔎 Compras / OCR":
 
                     matched=match_supplier_row(meta.get("proveedor_sugerido"), suppliers_pdf)
                     supplier_names=suppliers_pdf["nombre"].astype(str).tolist() if not suppliers_pdf.empty else []
-                    default_supplier=matched.get("nombre") if matched else (supplier_names[0] if supplier_names else "")
+                    detected_supplier_name=clean_display_value(meta.get("proveedor_sugerido"))
+
+                    if matched:
+                        default_supplier=matched.get("nombre")
+                    elif detected_supplier_name:
+                        # Mostrar el proveedor detectado aunque todavía no exista en catálogo.
+                        if detected_supplier_name not in supplier_names:
+                            supplier_names=[detected_supplier_name] + supplier_names
+                        default_supplier=detected_supplier_name
+                    else:
+                        default_supplier=supplier_names[0] if supplier_names else ""
 
                     a,b,c,d=st.columns([1.4,1,1,1])
                     detected_type = meta.get("tipo_documento") or "Presupuesto"
@@ -4121,7 +4138,13 @@ elif page == "🔎 Compras / OCR":
                     )
                     if supplier_names:
                         default_idx=supplier_names.index(default_supplier) if default_supplier in supplier_names else 0
-                        supplier_name=b.selectbox("Proveedor", supplier_names, index=default_idx, key=f"supplier_{digest}")
+                        supplier_name=b.selectbox(
+                            "Proveedor",
+                            supplier_names,
+                            index=default_idx,
+                            key=f"supplier_v3106_{digest}",
+                            help=f"Detectado desde PDF: {meta.get('proveedor_sugerido') or 'No identificado'}"
+                        )
                     else:
                         supplier_name=b.text_input("Proveedor", value=meta.get("proveedor_sugerido", ""), key=f"supplier_text_{digest}")
                     doc_number=c.text_input("Nº documento", value=str(meta.get("numero_documento", "")), key=f"num_{digest}")
@@ -4148,7 +4171,9 @@ elif page == "🔎 Compras / OCR":
                             key=f"total_{digest}"
                         )
                     f.metric("Ítems detectados", len(parsed_items))
-                    f.caption(f"Proveedor sugerido: {meta.get('proveedor_sugerido') or 'No identificado'}")
+                    f.caption(f"Proveedor detectado: {meta.get('proveedor_sugerido') or 'No identificado'}")
+                    if normalize_text(meta.get("proveedor_sugerido")) == "TECNO ELECTRIC":
+                        st.info("🏭 Proveedor detectado en este PDF: **TECNO ELECTRIC**")
                     observation=g.text_area("Observación", placeholder="Ej.: revisión 3, precio especial, factura escaneada...", key=f"obs_{digest}")
 
                     if parsed_items.empty:
@@ -4271,22 +4296,54 @@ elif page == "🔎 Compras / OCR":
                         key=f"save_{digest}",
                         disabled=bool(duplicate_doc),
                     ):
-                        if not supplier_names:
-                            st.warning("Primero cargá al menos un proveedor en Proveedores / Materiales.")
+                        if not supplier_name.strip():
+                            st.warning("Revisá el proveedor antes de guardar.")
                         elif not doc_number.strip():
                             st.warning("Revisá el número del documento antes de guardar.")
                         else:
                             supplier_row=suppliers_pdf[suppliers_pdf["nombre"].astype(str).eq(supplier_name)]
-                            if supplier_row.empty:
-                                st.warning("No se encontró el proveedor seleccionado.")
-                            else:
-                                meta_save={"tipo_documento":doc_type,"proveedor_nombre":supplier_name,"numero_documento":doc_number.strip(),"fecha":doc_date,"moneda":currency,"total":total,"archivo_nombre":pdf_file.name,"observacion":observation}
-                                try:
-                                    doc_id, count=save_purchase_document(meta_save, edited, supplier_row.iloc[0]["id"], auto_create)
-                                    st.success(f"Documento guardado como PENDIENTE DE REVISIÓN. {count} ítem(s) importados.")
-                                except Exception as exc:
-                                    st.error("No se pudo importar el documento.")
-                                    st.caption(str(exc))
+
+                            try:
+                                if supplier_row.empty:
+                                    # Si el PDF identificó un proveedor confiable que aún no estaba en catálogo,
+                                    # se crea al confirmar; nunca se reemplaza silenciosamente por el primer proveedor.
+                                    upsert_supplier(
+                                        supplier_name,
+                                        observacion="Creado automáticamente desde Compras/OCR"
+                                    )
+                                    suppliers_pdf=fetch_suppliers()
+                                    supplier_row=suppliers_pdf[
+                                        suppliers_pdf["nombre"].astype(str).eq(supplier_name)
+                                    ]
+
+                                if supplier_row.empty:
+                                    raise ValueError(
+                                        f"No pude resolver el proveedor seleccionado: {supplier_name}"
+                                    )
+
+                                meta_save={
+                                    "tipo_documento":doc_type,
+                                    "proveedor_nombre":supplier_name,
+                                    "numero_documento":doc_number.strip(),
+                                    "fecha":doc_date,
+                                    "moneda":currency,
+                                    "total":total,
+                                    "archivo_nombre":pdf_file.name,
+                                    "observacion":observation
+                                }
+                                doc_id, count=save_purchase_document(
+                                    meta_save,
+                                    edited,
+                                    supplier_row.iloc[0]["id"],
+                                    auto_create
+                                )
+                                st.success(
+                                    f"Documento guardado para {supplier_name} como PENDIENTE DE REVISIÓN. "
+                                    f"{count} ítem(s) importados."
+                                )
+                            except Exception as exc:
+                                st.error("No se pudo importar el documento.")
+                                st.caption(str(exc))
 
                     with st.expander("Ver texto extraído (diagnóstico)"):
                         st.text((meta.get("texto_extraido") or "")[:12000])
@@ -5077,6 +5134,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.10.5 Tecno Electric corregido</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.10.6 Proveedor PDF corregido</div>',
     unsafe_allow_html=True,
 )
