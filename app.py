@@ -33,7 +33,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.10.2 - Eliminación segura de documentos"
+APP_VERSION = "3.10.3 - Catálogo sincronizado"
 
 
 st.markdown("""
@@ -1337,6 +1337,83 @@ def fetch_purchase_document_items(document_id, document_row=None):
 
     return pd.DataFrame(recovered)
 
+
+
+
+def sync_catalog_from_document_items(edited_items, supplier_id=None, overwrite_existing=True):
+    """Sincroniza correcciones del documento con el catálogo maestro.
+
+    Actualiza:
+    - materiales.marca
+    - materiales.modelo
+    - material_proveedor.codigo_proveedor
+
+    overwrite_existing=True porque en esta etapa queremos que la corrección manual
+    hecha por el usuario prevalezca sobre el dato anterior del catálogo.
+    """
+    result = {
+        "materiales_actualizados": 0,
+        "codigos_actualizados": 0,
+        "sin_material": 0,
+        "errores": [],
+    }
+
+    if edited_items is None or edited_items.empty:
+        return result
+
+    for _, r in edited_items.iterrows():
+        material_id = clean_display_value(r.get("material_id"))
+        if not material_id:
+            result["sin_material"] += 1
+            continue
+
+        brand = clean_display_value(r.get("marca"))
+        model = clean_display_value(r.get("modelo"))
+        supplier_code = clean_display_value(r.get("codigo_proveedor"))
+
+        # 1) Catálogo maestro
+        payload = {}
+        if brand:
+            payload["marca"] = brand
+        if model:
+            payload["modelo"] = model
+
+        if payload:
+            try:
+                supabase.table("materiales").update(payload).eq("id", material_id).execute()
+                result["materiales_actualizados"] += 1
+            except Exception as exc:
+                result["errores"].append(f"Material {material_id}: {exc}")
+
+        # 2) Código del proveedor para ese material
+        if supplier_id and supplier_code:
+            try:
+                rels = (
+                    supabase.table("material_proveedor")
+                    .select("id,codigo_proveedor")
+                    .eq("material_id", material_id)
+                    .eq("proveedor_id", supplier_id)
+                    .limit(1)
+                    .execute()
+                    .data or []
+                )
+                if rels:
+                    rel_id = rels[0].get("id")
+                    supabase.table("material_proveedor").update({
+                        "codigo_proveedor": supplier_code
+                    }).eq("id", rel_id).execute()
+                else:
+                    add_material_supplier(
+                        material_id,
+                        supplier_id,
+                        priority=3,
+                        supplier_code=supplier_code,
+                    )
+                result["codigos_actualizados"] += 1
+            except Exception as exc:
+                result["errores"].append(f"Código proveedor {material_id}: {exc}")
+
+    return result
 
 
 def save_document_corrections(document_id, header_payload, items_df=None):
@@ -3904,7 +3981,7 @@ elif page == "🏷️ Stock":
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.10.2: permite eliminar definitivamente documentos, sus ítems y opcionalmente sus precios históricos vinculados.")
+    st.success("V3.10.3: las correcciones manuales de Marca, Modelo y Código proveedor ahora actualizan también el catálogo maestro.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -4316,6 +4393,33 @@ elif page == "🔎 Compras / OCR":
                         "El sistema no inventará precios ni subtotales."
                     )
 
+                sync_now = st.button(
+                    "🔄 Actualizar catálogo con Marca / Modelo / Código de estos ítems",
+                    use_container_width=True,
+                    key=f"sync_catalog_{doc_id}"
+                )
+                if sync_now:
+                    sid_sync = row.get("proveedor_id")
+                    if suppliers_admin is not None and not suppliers_admin.empty:
+                        hit_sync = suppliers_admin[suppliers_admin["nombre"].astype(str).eq(sname)]
+                        if not hit_sync.empty:
+                            sid_sync = hit_sync.iloc[0].get("id")
+                    try:
+                        sync_result = sync_catalog_from_document_items(
+                            edited_items,
+                            supplier_id=sid_sync,
+                            overwrite_existing=True
+                        )
+                        st.success(
+                            f"Catálogo actualizado. Materiales: {sync_result['materiales_actualizados']} · "
+                            f"Códigos proveedor: {sync_result['codigos_actualizados']}."
+                        )
+                        if sync_result["errores"]:
+                            st.warning("Detalle: " + " | ".join(sync_result["errores"][:5]))
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"No se pudo actualizar el catálogo: {exc}")
+
                 b1,b2,b3,b4=st.columns(4)
                 if b1.button("💾 Guardar correcciones",use_container_width=True,key=f"m_save_{doc_id}"):
                     if looks_like_absurd_money(total_calc):
@@ -4326,8 +4430,35 @@ elif page == "🔎 Compras / OCR":
                         hit=suppliers_admin[suppliers_admin["nombre"].astype(str).eq(sname)]
                         if not hit.empty: sid=hit.iloc[0].get("id")
                     try:
-                        save_document_corrections(doc_id,{"proveedor_id":sid,"proveedor_nombre":sname,"tipo_documento":dtype,"numero_documento":number.strip(),"fecha":ddate.isoformat(),"moneda":currency,"observacion":obs.strip() or None,"total":total_calc},edited_items)
-                        st.success("Correcciones guardadas.")
+                        save_document_corrections(
+                            doc_id,
+                            {
+                                "proveedor_id":sid,
+                                "proveedor_nombre":sname,
+                                "tipo_documento":dtype,
+                                "numero_documento":number.strip(),
+                                "fecha":ddate.isoformat(),
+                                "moneda":currency,
+                                "observacion":obs.strip() or None,
+                                "total":total_calc
+                            },
+                            edited_items
+                        )
+                        sync_result = sync_catalog_from_document_items(
+                            edited_items,
+                            supplier_id=sid,
+                            overwrite_existing=True
+                        )
+
+                        msg = "Correcciones guardadas y catálogo sincronizado."
+                        if sync_result["materiales_actualizados"]:
+                            msg += f" Materiales actualizados: {sync_result['materiales_actualizados']}."
+                        if sync_result["codigos_actualizados"]:
+                            msg += f" Códigos proveedor actualizados: {sync_result['codigos_actualizados']}."
+                        st.success(msg)
+
+                        if sync_result["errores"]:
+                            st.warning("Algunas sincronizaciones fallaron: " + " | ".join(sync_result["errores"][:5]))
                         st.rerun()
                     except Exception as exc:
                         st.error(f"No se pudo guardar: {exc}")
@@ -4442,10 +4573,17 @@ elif page == "🔎 Compras / OCR":
                     else:
                         try:
                             apply_repair_to_document(doc_id, edited_items, total_calc, repair_note)
-                            st.success(
-                                "Reparación aplicada. Se guardaron los ítems visibles y se reemplazó "
-                                "el total histórico del documento. El historial de precios no fue modificado."
+                            sync_result = sync_catalog_from_document_items(
+                                edited_items,
+                                supplier_id=row.get("proveedor_id"),
+                                overwrite_existing=True
                             )
+                            st.success(
+                                "Reparación aplicada y catálogo sincronizado. "
+                                f"Materiales actualizados: {sync_result['materiales_actualizados']}."
+                            )
+                            if sync_result["errores"]:
+                                st.warning("Detalle: " + " | ".join(sync_result["errores"][:5]))
                             st.rerun()
                         except Exception as exc:
                             st.error(f"No se pudo aplicar la reparación: {exc}")
@@ -4833,6 +4971,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.10.2 Eliminación segura de documentos</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.10.3 Catálogo sincronizado</div>',
     unsafe_allow_html=True,
 )
