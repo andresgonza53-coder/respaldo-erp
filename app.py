@@ -33,7 +33,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.9.5 - Lectura validada por proveedor"
+APP_VERSION = "3.9.6 - Gestión de documentos"
 
 
 st.markdown("""
@@ -1209,6 +1209,49 @@ def clean_display_value(value):
     return "" if text.lower() in {"nan", "none", "nat"} else text
 
 
+def fetch_purchase_document_items(document_id):
+    try:
+        rows=(supabase.table("documentos_compra_items").select("*").eq("documento_id",document_id).order("orden").execute().data or [])
+        return pd.DataFrame(rows)
+    except Exception:
+        return pd.DataFrame()
+
+def save_document_corrections(document_id, header_payload, items_df=None):
+    supabase.table("documentos_compra").update(header_payload).eq("id",document_id).execute()
+    if items_df is not None and not items_df.empty:
+        for _,r in items_df.iterrows():
+            rid=clean_display_value(r.get("id"))
+            payload={
+                "orden":int(r.get("orden",0) or 0),
+                "codigo_proveedor":clean_display_value(r.get("codigo_proveedor")) or None,
+                "descripcion":clean_display_value(r.get("descripcion")) or None,
+                "marca":clean_display_value(r.get("marca")) or None,
+                "modelo":clean_display_value(r.get("modelo")) or None,
+                "cantidad":float(r.get("cantidad",0) or 0),
+                "unidad":clean_display_value(r.get("unidad")) or "und",
+                "precio_unitario":float(r.get("precio_unitario",0) or 0),
+                "subtotal":float(r.get("subtotal",0) or 0),
+                "confirmado":bool(r.get("confirmado",True)),
+                "material_id":clean_display_value(r.get("material_id")) or None,
+            }
+            if rid:
+                supabase.table("documentos_compra_items").update(payload).eq("id",rid).execute()
+            else:
+                payload["documento_id"]=document_id
+                supabase.table("documentos_compra_items").insert(payload).execute()
+
+def set_document_review_status(document_id, status, reason=""):
+    email=getattr(st.session_state.auth_user,"email","") or ""
+    now=datetime.now().isoformat()
+    payload={"estado_revision":status}
+    if status=="Revisado":
+        payload.update({"aprobado":True,"anulado":False,"revisado_por":email,"revisado_en":now})
+    elif status=="Anulado":
+        payload.update({"aprobado":False,"anulado":True,"anulado_por":email,"anulado_en":now,"motivo_anulacion":clean_display_value(reason) or None})
+    else:
+        payload.update({"aprobado":False,"anulado":False})
+    return supabase.table("documentos_compra").update(payload).eq("id",document_id).execute()
+
 def purchase_document_exists(supplier_id, number, dtype):
     """Comprueba si el mismo documento ya fue importado."""
     number = str(number or "").strip()
@@ -1218,7 +1261,7 @@ def purchase_document_exists(supplier_id, number, dtype):
     try:
         rows = (
             supabase.table("documentos_compra")
-            .select("id,fecha,estado,archivo_nombre,creado_en")
+            .select("id,fecha,estado,archivo_nombre,creado_en,anulado,estado_revision")
             .eq("proveedor_id", supplier_id)
             .eq("numero_documento", number)
             .eq("tipo_documento", dtype)
@@ -1226,6 +1269,7 @@ def purchase_document_exists(supplier_id, number, dtype):
             .execute()
             .data or []
         )
+        rows=[r for r in rows if not bool(r.get("anulado",False))]
         return rows[0] if rows else None
     except Exception:
         return None
@@ -2743,6 +2787,7 @@ def save_purchase_document(meta, items_df, supplier_id, auto_create_materials=Tr
         "tipo_documento":dtype,"proveedor_id":supplier_id,"proveedor_nombre":meta.get("proveedor_nombre") or None,
         "numero_documento":number or None,"fecha":meta.get("fecha").isoformat() if hasattr(meta.get("fecha"),"isoformat") else meta.get("fecha"),
         "moneda":meta.get("moneda") or "PYG","total":float(meta.get("total",0) or 0),"estado":"Importado",
+        "estado_revision":"Pendiente de revisión","aprobado":False,"anulado":False,
         "archivo_nombre":meta.get("archivo_nombre") or None,"observacion":meta.get("observacion") or None,
         "registrado_por":getattr(st.session_state.auth_user,"email","") or "",
     }
@@ -3434,7 +3479,7 @@ elif page == "🏷️ Stock":
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.9.5: lectura validada con parsers específicos. CCP y Tecno Electric se reconocen por su formato real; los PDF escaneados quedan separados para OCR.")
+    st.success("V3.9.6: además de importar, ahora podés revisar, corregir, aprobar, anular y restaurar documentos cargados.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -3630,7 +3675,7 @@ elif page == "🔎 Compras / OCR":
                                 meta_save={"tipo_documento":doc_type,"proveedor_nombre":supplier_name,"numero_documento":doc_number.strip(),"fecha":doc_date,"moneda":currency,"total":total,"archivo_nombre":pdf_file.name,"observacion":observation}
                                 try:
                                     doc_id, count=save_purchase_document(meta_save, edited, supplier_row.iloc[0]["id"], auto_create)
-                                    st.success(f"Documento guardado. {count} ítem(s) importados y precios actualizados.")
+                                    st.success(f"Documento guardado como PENDIENTE DE REVISIÓN. {count} ítem(s) importados.")
                                 except Exception as exc:
                                     st.error("No se pudo importar el documento.")
                                     st.caption(str(exc))
@@ -3639,15 +3684,101 @@ elif page == "🔎 Compras / OCR":
                         st.text((meta.get("texto_extraido") or "")[:12000])
 
     with tab_history:
+        st.subheader("Documentos importados")
+        st.caption("La persona de carga puede subir documentos; después podés corregirlos, aprobarlos, anularlos o restaurarlos.")
         docs=fetch_purchase_documents()
         if docs.empty:
             st.info("Todavía no hay documentos importados.")
         else:
+            suppliers_admin=fetch_suppliers()
+            supplier_names_admin=suppliers_admin["nombre"].dropna().astype(str).tolist() if suppliers_admin is not None and not suppliers_admin.empty else []
+            supplier_by_id={str(r.get("id")):clean_display_value(r.get("nombre")) for _,r in suppliers_admin.iterrows()} if suppliers_admin is not None and not suppliers_admin.empty else {}
+
             view=docs.copy()
-            if "total" in view.columns:
-                view["total"]=view["total"].apply(lambda x: pyg(x) if pd.notna(x) else "")
-            cols=[c for c in ["fecha","tipo_documento","proveedor_nombre","numero_documento","moneda","total","estado","archivo_nombre","registrado_por"] if c in view.columns]
-            st.dataframe(view[cols], hide_index=True, use_container_width=True)
+            view["Proveedor"]=view.get("proveedor_id",pd.Series(dtype=str)).astype(str).map(supplier_by_id)
+            if "proveedor_nombre" in view.columns:
+                view["Proveedor"]=view["Proveedor"].fillna(view["proveedor_nombre"])
+            if "estado_revision" not in view.columns: view["estado_revision"]="Pendiente de revisión"
+            if "aprobado" not in view.columns: view["aprobado"]=False
+            if "anulado" not in view.columns: view["anulado"]=False
+
+            f1,f2,f3=st.columns([2,1,1])
+            q=f1.text_input("Buscar",placeholder="Proveedor, número o archivo...")
+            estado_f=f2.selectbox("Estado",["Todos","Pendiente de revisión","Revisado","Anulado"])
+            tipo_f=f3.selectbox("Tipo",["Todos","Presupuesto","Factura"])
+            filtered=view.copy()
+            if q.strip():
+                nq=normalize_text(q)
+                mask=(filtered["Proveedor"].astype(str).map(normalize_text).str.contains(nq,na=False)|filtered["numero_documento"].astype(str).map(normalize_text).str.contains(nq,na=False)|filtered["archivo_nombre"].astype(str).map(normalize_text).str.contains(nq,na=False))
+                filtered=filtered[mask]
+            if estado_f!="Todos": filtered=filtered[filtered["estado_revision"].astype(str).eq(estado_f)]
+            if tipo_f!="Todos": filtered=filtered[filtered["tipo_documento"].astype(str).eq(tipo_f)]
+
+            cols=[c for c in ["Proveedor","tipo_documento","numero_documento","fecha","moneda","total","estado_revision","archivo_nombre","registrado_por","creado_en"] if c in filtered.columns]
+            st.dataframe(filtered[cols],hide_index=True,use_container_width=True,column_config={"total":st.column_config.NumberColumn("Total",format="%.0f"),"tipo_documento":"Tipo","numero_documento":"Nº documento","estado_revision":"Estado","archivo_nombre":"Archivo"})
+
+            if not filtered.empty:
+                options={f"{clean_display_value(r.get('Proveedor'))} · {clean_display_value(r.get('tipo_documento'))} {clean_display_value(r.get('numero_documento'))} · {clean_display_value(r.get('fecha'))}":str(r.get("id")) for _,r in filtered.iterrows()}
+                label=st.selectbox("Abrir documento",list(options.keys()))
+                doc_id=options[label]
+                row=filtered[filtered["id"].astype(str).eq(doc_id)].iloc[0]
+                st.markdown("### Revisar / corregir")
+                c1,c2,c3,c4=st.columns(4)
+                dtype=c1.selectbox("Tipo",["Presupuesto","Factura"],index=0 if clean_display_value(row.get("tipo_documento"))!="Factura" else 1,key=f"m_type_{doc_id}")
+                current_supplier=supplier_by_id.get(str(row.get("proveedor_id")),clean_display_value(row.get("Proveedor")))
+                sidx=supplier_names_admin.index(current_supplier) if current_supplier in supplier_names_admin else 0
+                sname=c2.selectbox("Proveedor",supplier_names_admin or [current_supplier or "Sin proveedor"],index=sidx,key=f"m_supplier_{doc_id}")
+                number=c3.text_input("Nº documento",value=clean_display_value(row.get("numero_documento")),key=f"m_num_{doc_id}")
+                parsed_date=pd.to_datetime(row.get("fecha"),errors="coerce")
+                dval=parsed_date.date() if pd.notna(parsed_date) else date.today()
+                ddate=c4.date_input("Fecha",value=dval,key=f"m_date_{doc_id}")
+                c5,c6=st.columns([1,3])
+                currency=c5.selectbox("Moneda",["PYG","USD"],index=0 if clean_display_value(row.get("moneda"))!="USD" else 1,key=f"m_cur_{doc_id}")
+                obs=c6.text_area("Observación",value=clean_display_value(row.get("observacion")),key=f"m_obs_{doc_id}")
+
+                items=fetch_purchase_document_items(doc_id)
+                st.markdown("#### Ítems")
+                if items.empty:
+                    items=pd.DataFrame(columns=["id","orden","codigo_proveedor","descripcion","marca","modelo","cantidad","unidad","precio_unitario","subtotal","material_id","confirmado"])
+                edit_cols=[c for c in ["id","orden","codigo_proveedor","descripcion","marca","modelo","cantidad","unidad","precio_unitario","subtotal","material_id","confirmado"] if c in items.columns]
+                edited_items=st.data_editor(items[edit_cols],hide_index=True,use_container_width=True,num_rows="dynamic",key=f"m_items_{doc_id}",disabled=[c for c in ["id","material_id"] if c in edit_cols],column_config={"descripcion":st.column_config.TextColumn("Descripción",width="large"),"precio_unitario":st.column_config.NumberColumn("Precio unit.",format="%.0f"),"subtotal":st.column_config.NumberColumn("Subtotal",format="%.0f"),"confirmado":st.column_config.CheckboxColumn("Activo")})
+                total_calc=float(pd.to_numeric(edited_items.get("subtotal",pd.Series(dtype=float)),errors="coerce").fillna(0).sum()) if edited_items is not None else 0
+                st.metric("Total recalculado",pyg(total_calc))
+
+                b1,b2,b3,b4=st.columns(4)
+                if b1.button("💾 Guardar correcciones",use_container_width=True,key=f"m_save_{doc_id}"):
+                    sid=row.get("proveedor_id")
+                    if suppliers_admin is not None and not suppliers_admin.empty:
+                        hit=suppliers_admin[suppliers_admin["nombre"].astype(str).eq(sname)]
+                        if not hit.empty: sid=hit.iloc[0].get("id")
+                    try:
+                        save_document_corrections(doc_id,{"proveedor_id":sid,"proveedor_nombre":sname,"tipo_documento":dtype,"numero_documento":number.strip(),"fecha":ddate.isoformat(),"moneda":currency,"observacion":obs.strip() or None,"total":total_calc},edited_items)
+                        st.success("Correcciones guardadas.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"No se pudo guardar: {exc}")
+                if b2.button("✅ Aprobar",use_container_width=True,key=f"m_ok_{doc_id}"):
+                    try:
+                        set_document_review_status(doc_id,"Revisado")
+                        st.success("Documento aprobado.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"No se pudo aprobar: {exc}")
+                reason=st.text_input("Motivo de anulación",placeholder="Ej.: duplicado, proveedor equivocado...",key=f"m_reason_{doc_id}")
+                if b3.button("🚫 Anular",use_container_width=True,key=f"m_cancel_{doc_id}"):
+                    try:
+                        set_document_review_status(doc_id,"Anulado",reason)
+                        st.success("Documento anulado.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"No se pudo anular: {exc}")
+                if b4.button("↩️ Restaurar",use_container_width=True,key=f"m_restore_{doc_id}"):
+                    try:
+                        set_document_review_status(doc_id,"Pendiente de revisión")
+                        st.success("Documento restaurado a pendiente.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"No se pudo restaurar: {exc}")
 
 
 # ============================================================
@@ -4032,6 +4163,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9.5 Lectura validada por proveedor</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9.6 Gestión de documentos</div>',
     unsafe_allow_html=True,
 )
