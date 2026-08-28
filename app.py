@@ -33,7 +33,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.10.3 - Catálogo sincronizado"
+APP_VERSION = "3.10.4 - Separadores de miles"
 
 
 st.markdown("""
@@ -807,6 +807,33 @@ def create_timeline(client_name, crm_df):
 # PRESUPUESTOS V3.4
 # ============================================================
 QUOTE_STATES = ["Borrador", "Enviado", "Aprobado", "Rechazado"]
+
+
+def format_pyg_input(value):
+    """Formatea números enteros con punto como separador de miles."""
+    try:
+        n = int(round(float(value or 0)))
+    except Exception:
+        n = 0
+    return f"{n:,}".replace(",", ".")
+
+
+def parse_pyg_input(value):
+    """Convierte texto tipo 3.023.000 o 3,023,000 a número."""
+    if value is None:
+        return 0.0
+    s = str(value).strip()
+    if not s:
+        return 0.0
+    s = s.replace("Gs.", "").replace("Gs", "").replace("₲", "").strip()
+    # Para carga PYG usamos separadores de miles; quitamos puntos/comas/espacios.
+    s = re.sub(r"[.\s,]", "", s)
+    s = re.sub(r"[^0-9\-]", "", s)
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
 
 def pyg(value):
     try:
@@ -3981,7 +4008,7 @@ elif page == "🏷️ Stock":
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.10.3: las correcciones manuales de Marca, Modelo y Código proveedor ahora actualizan también el catálogo maestro.")
+    st.success("V3.10.4: los importes en guaraníes ahora se muestran con separador de miles para facilitar la carga y revisión.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -4041,7 +4068,24 @@ elif page == "🔎 Compras / OCR":
 
                     e,f,g=st.columns([1,1,2])
                     currency=e.selectbox("Moneda", ["PYG","USD"], index=0 if meta.get("moneda")!="USD" else 1, key=f"curr_{digest}")
-                    total=e.number_input("Total documento", min_value=0.0, value=float(meta.get("total",0) or 0), step=1000.0, format="%.0f", key=f"total_{digest}")
+                    if currency == "PYG":
+                        total_text = e.text_input(
+                            "Total documento",
+                            value=format_pyg_input(meta.get("total",0) or 0),
+                            key=f"total_text_{digest}",
+                            help="Podés escribir 3023000 o 3.023.000"
+                        )
+                        total = parse_pyg_input(total_text)
+                        e.caption(f"Gs. {format_pyg_input(total)}")
+                    else:
+                        total=e.number_input(
+                            "Total documento",
+                            min_value=0.0,
+                            value=float(meta.get("total",0) or 0),
+                            step=1.0,
+                            format="%.2f",
+                            key=f"total_{digest}"
+                        )
                     f.metric("Ítems detectados", len(parsed_items))
                     f.caption(f"Proveedor sugerido: {meta.get('proveedor_sugerido') or 'No identificado'}")
                     observation=g.text_area("Observación", placeholder="Ej.: revisión 3, precio especial, factura escaneada...", key=f"obs_{digest}")
@@ -4076,6 +4120,7 @@ elif page == "🔎 Compras / OCR":
 
                     parsed_items = enrich_items_for_catalog(parsed_items, supplier_row_id_for_preview, currency)
                     st.markdown("#### Validar ítems")
+                    st.caption("💡 Los importes en PYG se muestran con punto como separador de miles: 5.850 · 201.356 · 3.023.000.")
                     st.caption("V3.9.5: el diagnóstico muestra cuántos ítems encontró cada parser y solo acepta filas que pasan validación cantidad × precio ≈ subtotal.")
                     comparison_df = purchase_comparison_summary(parsed_items)
                     if not comparison_df.empty:
@@ -4134,8 +4179,8 @@ elif page == "🔎 Compras / OCR":
                             "modelo": st.column_config.TextColumn("Modelo / Ref."),
                             "cantidad": st.column_config.NumberColumn("Cantidad", min_value=0.0, step=1.0),
                             "unidad": st.column_config.TextColumn("Unidad"),
-                            "precio_unitario": st.column_config.NumberColumn("Precio unit.", min_value=0.0, step=1000.0, format="%.0f"),
-                            "subtotal": st.column_config.NumberColumn("Subtotal", min_value=0.0, step=1000.0, format="%.0f"),
+                            "precio_unitario": st.column_config.NumberColumn("Precio unit.", min_value=0.0, step=1000.0, format="localized"),
+                            "subtotal": st.column_config.NumberColumn("Subtotal", min_value=0.0, step=1000.0, format="localized"),
                             "confirmado": st.column_config.CheckboxColumn("Importar"),
                         }
                     )
@@ -4217,7 +4262,7 @@ elif page == "🔎 Compras / OCR":
             if tipo_f!="Todos": filtered=filtered[filtered["tipo_documento"].astype(str).eq(tipo_f)]
 
             cols=[c for c in ["Proveedor","tipo_documento","numero_documento","fecha","moneda","total","estado_revision","archivo_nombre","registrado_por","creado_en"] if c in filtered.columns]
-            st.dataframe(filtered[cols],hide_index=True,use_container_width=True,column_config={"total":st.column_config.NumberColumn("Total",format="%.0f"),"tipo_documento":"Tipo","numero_documento":"Nº documento","estado_revision":"Estado","archivo_nombre":"Archivo"})
+            st.dataframe(filtered[cols],hide_index=True,use_container_width=True,column_config={"total":st.column_config.NumberColumn("Total",format="localized"),"tipo_documento":"Tipo","numero_documento":"Nº documento","estado_revision":"Estado","archivo_nombre":"Archivo"})
 
             if not filtered.empty:
                 with st.expander("🗑️ Eliminar varios documentos", expanded=False):
@@ -4971,6 +5016,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.10.3 Catálogo sincronizado</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.10.4 Separadores de miles</div>',
     unsafe_allow_html=True,
 )
