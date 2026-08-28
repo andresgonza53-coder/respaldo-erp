@@ -33,7 +33,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.9.7 - Recuperación de ítems históricos"
+APP_VERSION = "3.9.8 - Normalización monetaria segura"
 
 
 st.markdown("""
@@ -1311,11 +1311,12 @@ def fetch_purchase_document_items(document_id, document_row=None):
 
         ms = re.search(r"Subtotal\s+([0-9.,]+)", obs, flags=re.I)
         if ms:
-            subtotal = parse_money(ms.group(1))
+            subtotal = safe_money(ms.group(1))
 
-        price = float(h.get("precio", 0) or 0)
-        if subtotal <= 0 and price > 0:
-            subtotal = qty * price
+        price = safe_money(h.get("precio", 0))
+        expected = qty * price if qty > 0 and price > 0 else 0
+        if subtotal <= 0 or looks_like_absurd_money(subtotal, expected if expected > 0 else None):
+            subtotal = expected
 
         mid = h.get("material_id")
         mat = mat_map.get(str(mid), {})
@@ -1347,10 +1348,11 @@ def save_document_corrections(document_id, header_payload, items_df=None):
         for _,r in items_df.iterrows():
             rid=clean_display_value(r.get("id"))
             qty=float(r.get("cantidad",0) or 0)
-            price=float(r.get("precio_unitario",0) or 0)
-            subtotal=float(r.get("subtotal",0) or 0)
-            if subtotal <= 0 and qty > 0 and price > 0:
-                subtotal = qty * price
+            price=safe_money(r.get("precio_unitario",0))
+            subtotal=safe_money(r.get("subtotal",0))
+            expected = qty * price if qty > 0 and price > 0 else 0
+            if subtotal <= 0 or looks_like_absurd_money(subtotal, expected if expected > 0 else None):
+                subtotal = expected
 
             payload={
                 "orden":int(r.get("orden",0) or 0),
@@ -1415,34 +1417,104 @@ def normalize_text(value):
 
 
 def parse_money(value):
-    """Convierte 1.507.000 / 1,507,000 / 110.733,00 a float."""
+    """Convierte importes PYG/internacionales a float de forma segura."""
     if value is None:
         return 0.0
-    text = re.sub(r"[^0-9,.-]", "", str(value))
-    if not text:
+
+    s = str(value).strip()
+    if not s:
         return 0.0
-    # Si hay punto y coma, el último separador decide los decimales.
-    if "." in text and "," in text:
-        if text.rfind(",") > text.rfind("."):
-            text = text.replace(".", "").replace(",", ".")
+
+    s = s.replace("\u00a0", " ")
+    s = re.sub(r"(?i)\b(?:PYG|GS|G\.S\.|GUARAN[IÍ]ES?|USD|US\$|U\$S)\b", "", s)
+    s = s.replace("₲", "").replace("$", "")
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[^0-9,.\-]", "", s)
+
+    if not s or s in {"-", ".", ",", "-.", "-,"}:
+        return 0.0
+
+    negative = s.startswith("-")
+    s = s.lstrip("-")
+
+    if "." in s and "," in s:
+        last_dot = s.rfind(".")
+        last_comma = s.rfind(",")
+        if last_comma > last_dot:
+            int_part = s[:last_comma].replace(".", "").replace(",", "")
+            dec_part = s[last_comma + 1:]
         else:
-            text = text.replace(",", "")
-    elif text.count(".") > 1:
-        text = text.replace(".", "")
-    elif text.count(",") > 1:
-        text = text.replace(",", "")
-    elif "," in text:
-        tail=text.split(",")[-1]
-        text = text.replace(".", "")
-        text = text.replace(",", "." if len(tail) <= 2 else "")
-    elif "." in text:
-        tail=text.split(".")[-1]
-        if len(tail)==3:
-            text=text.replace(".", "")
+            int_part = s[:last_dot].replace(",", "").replace(".", "")
+            dec_part = s[last_dot + 1:]
+        s = int_part + ("." + dec_part if dec_part else "")
+
+    elif "," in s:
+        parts = s.split(",")
+        if len(parts) > 2:
+            if all(len(p) == 3 for p in parts[1:]):
+                s = "".join(parts)
+            else:
+                s = "".join(parts[:-1]) + "." + parts[-1]
+        else:
+            a, b = parts
+            if len(b) in (1, 2):
+                s = a + "." + b
+            elif len(b) == 3:
+                s = a + b
+            else:
+                s = a + "." + b
+
+    elif "." in s:
+        parts = s.split(".")
+        if len(parts) > 2:
+            if all(len(p) == 3 for p in parts[1:]):
+                s = "".join(parts)
+            else:
+                s = "".join(parts[:-1]) + "." + parts[-1]
+        else:
+            a, b = parts
+            if len(b) == 3:
+                s = a + b
+            elif len(b) in (1, 2):
+                s = a + "." + b
+            else:
+                s = a + b
+
     try:
-        return float(text)
+        num = float(s)
     except Exception:
         return 0.0
+    return -num if negative else num
+
+
+def safe_money(value, max_value=100_000_000_000.0):
+    num = parse_money(value)
+    if not (num == num):
+        return 0.0
+    if abs(num) > max_value:
+        return 0.0
+    return float(num)
+
+
+def looks_like_absurd_money(value, reference=None):
+    try:
+        val = float(value or 0)
+    except Exception:
+        return True
+
+    if val < 0 or val > 100_000_000_000:
+        return True
+
+    if reference not in (None, "", 0):
+        try:
+            ref = float(reference)
+            if ref > 0 and val > ref * 1000:
+                return True
+        except Exception:
+            pass
+
+    return False
+
 
 
 def extract_pdf_text(uploaded_file):
@@ -3610,7 +3682,7 @@ elif page == "🏷️ Stock":
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.9.7: además de editar documentos, recupera ítems de cargas antiguas desde el historial de precios cuando faltan en el detalle.")
+    st.success("V3.9.8: normaliza importes PYG/internacionales y corrige valores absurdos antes de guardar.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -3879,18 +3951,30 @@ elif page == "🔎 Compras / OCR":
                     )
                 edit_cols=[c for c in ["id","orden","codigo_proveedor","descripcion","marca","modelo","cantidad","unidad","precio_unitario","subtotal","material_id","confirmado"] if c in items.columns]
                 edited_items=st.data_editor(items[edit_cols],hide_index=True,use_container_width=True,num_rows="dynamic",key=f"m_items_{doc_id}",disabled=[c for c in ["id","material_id"] if c in edit_cols],column_config={"descripcion":st.column_config.TextColumn("Descripción",width="large"),"precio_unitario":st.column_config.NumberColumn("Precio unit.",format="%.0f"),"subtotal":st.column_config.NumberColumn("Subtotal",format="%.0f"),"confirmado":st.column_config.CheckboxColumn("Activo")})
+                total_calc=0.0
+                suspicious_rows=[]
                 if edited_items is not None and not edited_items.empty:
-                    subt = pd.to_numeric(edited_items.get("subtotal",pd.Series(index=edited_items.index,dtype=float)),errors="coerce")
-                    qtys = pd.to_numeric(edited_items.get("cantidad",pd.Series(index=edited_items.index,dtype=float)),errors="coerce").fillna(0)
-                    prices = pd.to_numeric(edited_items.get("precio_unitario",pd.Series(index=edited_items.index,dtype=float)),errors="coerce").fillna(0)
-                    subt = subt.where(subt.fillna(0) > 0, qtys * prices).fillna(0)
-                    total_calc=float(subt.sum())
-                else:
-                    total_calc=0
+                    for idx_row, rr in edited_items.iterrows():
+                        qty=float(rr.get("cantidad",0) or 0)
+                        price=safe_money(rr.get("precio_unitario",0))
+                        subtotal=safe_money(rr.get("subtotal",0))
+                        expected=qty * price if qty > 0 and price > 0 else 0
+                        if subtotal <= 0 or looks_like_absurd_money(subtotal, expected if expected > 0 else None):
+                            subtotal=expected
+                            suspicious_rows.append(str(idx_row))
+                        total_calc += subtotal
                 st.metric("Total recalculado",pyg(total_calc))
+                if suspicious_rows:
+                    st.warning(
+                        f"⚠️ Se corrigieron automáticamente {len(suspicious_rows)} importe(s) sospechoso(s) "
+                        "usando Cantidad × Precio unitario."
+                    )
 
                 b1,b2,b3,b4=st.columns(4)
                 if b1.button("💾 Guardar correcciones",use_container_width=True,key=f"m_save_{doc_id}"):
+                    if looks_like_absurd_money(total_calc):
+                        st.error("El total calculado es inválido o demasiado grande. Revisá cantidades y precios.")
+                        st.stop()
                     sid=row.get("proveedor_id")
                     if suppliers_admin is not None and not suppliers_admin.empty:
                         hit=suppliers_admin[suppliers_admin["nombre"].astype(str).eq(sname)]
@@ -4307,6 +4391,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9.7 Recuperación de ítems históricos</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9.8 Normalización monetaria segura</div>',
     unsafe_allow_html=True,
 )
