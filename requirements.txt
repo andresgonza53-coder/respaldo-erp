@@ -5,3 +5,5 @@ supabase
 reportlab
 pypdf
 pymupdf
+rapidocr-onnxruntime
+opencv-python-headless

@@ -16,6 +16,16 @@ from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
 
 try:
+    from rapidocr_onnxruntime import RapidOCR
+except Exception:
+    RapidOCR = None
+
+try:
+    import fitz
+except Exception:
+    fitz = None
+
+try:
     from pypdf import PdfReader
 except Exception:
     PdfReader = None
@@ -33,7 +43,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.11.0 - Lote facturas junio 2026"
+APP_VERSION = "3.12.0 - OCR automático de escaneados"
 
 
 st.markdown("""
@@ -1891,6 +1901,76 @@ def parse_known_scanned_invoice(uploaded_file):
     return meta, items_df
 
 
+
+@st.cache_resource(show_spinner=False)
+def get_rapidocr_engine():
+    if RapidOCR is None:
+        return None
+    try:
+        return RapidOCR()
+    except Exception:
+        return None
+
+
+def parse_purchase_filename(filename):
+    name=clean_display_value(filename)
+    stem=re.sub(r"\.pdf$","",name,flags=re.I)
+    parts=[p.strip() for p in stem.split("-")]
+    out={"proveedor":"","numero_corto":"","fecha":None}
+    if len(parts)>=4 and normalize_text(parts[0])=="COMPRA":
+        mmdd=re.sub(r"\D","",parts[1]); number=re.sub(r"\D","",parts[2])
+        out["proveedor"]=parts[3].strip().upper(); out["numero_corto"]=number
+        if len(mmdd)==4:
+            try: out["fecha"]=date(2026,int(mmdd[:2]),int(mmdd[2:]))
+            except Exception: pass
+    return out
+
+
+def ocr_pdf_image(uploaded_file,max_pages=2,zoom=2.2):
+    if fitz is None:
+        return "",{"ok":False,"reason":"PyMuPDF no disponible"}
+    engine=get_rapidocr_engine()
+    if engine is None:
+        return "",{"ok":False,"reason":"RapidOCR no disponible"}
+    try: doc=fitz.open(stream=uploaded_file.getvalue(),filetype="pdf")
+    except Exception as exc: return "",{"ok":False,"reason":str(exc)}
+    all_lines=[]; dbg=[]
+    try:
+        for pno in range(min(len(doc),max_pages)):
+            page=doc.load_page(pno)
+            pix=page.get_pixmap(matrix=fitz.Matrix(zoom,zoom),alpha=False)
+            try: result,_=engine(pix.tobytes("png"))
+            except Exception as exc:
+                dbg.append({"page":pno+1,"error":str(exc)}); continue
+            lines=[]
+            for row in result or []:
+                if len(row)<2: continue
+                txt=clean_display_value(row[1]); score=float(row[2]) if len(row)>2 and row[2] is not None else 0
+                if txt and score>=0.35: lines.append(txt)
+            all_lines.extend(lines); dbg.append({"page":pno+1,"lines":len(lines)})
+    finally: doc.close()
+    raw="\n".join(all_lines)
+    return raw,{"ok":bool(raw.strip()),"pages":dbg,"chars":len(raw),"lines":len(all_lines)}
+
+
+def enrich_meta_from_filename(meta,uploaded_file):
+    info=parse_purchase_filename(getattr(uploaded_file,"name",""))
+    if not clean_display_value(meta.get("proveedor_sugerido")) and info.get("proveedor"):
+        meta["proveedor_sugerido"]=info["proveedor"]
+    num=clean_display_value(meta.get("numero_documento"))
+    if (not num or len(re.sub(r"\D","",num))<4) and info.get("numero_corto"):
+        meta["numero_documento"]=info["numero_corto"]
+    if not meta.get("fecha") and info.get("fecha"): meta["fecha"]=info["fecha"]
+    return meta
+
+
+def normalize_ocr_provider_name(name):
+    compact=re.sub(r"[^A-Z0-9]","",normalize_text(name))
+    mapping={"ELECTROPAR":"ELECTROPAR","COMPANIACOMERCIALDELPARAGUAY":"CCP","CCP":"CCP","MGIINGENIERIA":"MGI","MGI":"MGI","COMAGRO":"COMAGRO","ITSA":"ITSA","TECNOELECTRIC":"TECNO ELECTRIC","TECNO":"TECNO ELECTRIC","EVEREST":"EVEREST"}
+    for k,v in mapping.items():
+        if k in compact: return v
+    return clean_display_value(name).upper()
+
 def extract_pdf_text(uploaded_file):
     """Extrae texto usando PyMuPDF y pypdf, eligiendo el resultado más útil.
 
@@ -3316,10 +3396,19 @@ def parse_supplier_pdf(uploaded_file):
         return known
 
     raw = extract_pdf_text(uploaded_file)
+    used_ocr = False
+    ocr_debug = {}
+    quality = pdf_text_quality(raw)
+    if quality.get("parece_escaneado") or len(str(raw or "").strip()) < 80:
+        ocr_text, ocr_debug = ocr_pdf_image(uploaded_file)
+        if ocr_text and len(ocr_text.strip()) > len(str(raw or "").strip()):
+            raw = ocr_text
+            used_ocr = True
+            quality = pdf_text_quality(raw)
+
     supplier = guess_supplier_name(raw)
     n = normalize_text(raw)
 
-    quality = pdf_text_quality(raw)
     parser_candidates = []
 
     # Parser específico del proveedor, si corresponde.
@@ -3395,7 +3484,14 @@ def parse_supplier_pdf(uploaded_file):
         "resultado_parsers": parser_results,
         "requiere_ocr": bool(quality.get("parece_escaneado")),
         "items_detectados": len(clean_items),
+        "ocr_automatico": used_ocr,
+        "ocr_debug": ocr_debug,
     }
+    meta = enrich_meta_from_filename(meta, uploaded_file)
+    meta["proveedor_sugerido"] = normalize_ocr_provider_name(meta.get("proveedor_sugerido"))
+    if used_ocr:
+        meta["parser_usado"] = f"OCR + {best_name}"
+        meta["requiere_ocr"] = False if len(clean_items) > 0 else True
     return meta, pd.DataFrame(clean_items)
 
 
@@ -4348,7 +4444,7 @@ elif page == "🏷️ Stock":
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.11.0: incluye lectura validada para las 17 facturas escaneadas de junio 2026 (Tecno, Everest, ITSA, Comagro, Electropar, MGI y CCP).")
+    st.success("V3.12.0: además del lote validado, intenta OCR automático en nuevas facturas escaneadas y usa el nombre del archivo como respaldo de proveedor, fecha y número.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -4444,6 +4540,8 @@ elif page == "🔎 Compras / OCR":
                         )
                     f.metric("Ítems detectados", len(parsed_items))
                     f.caption(f"Proveedor detectado: {meta.get('proveedor_sugerido') or 'No identificado'}")
+                    if meta.get("ocr_automatico"):
+                        f.caption(f"OCR automático: {meta.get('ocr_debug',{}).get('lines',0)} líneas leídas")
 
                     if meta.get("lote_validado"):
                         st.success(
@@ -4451,6 +4549,11 @@ elif page == "🔎 Compras / OCR":
                             f"{meta.get('proveedor_sugerido')} · {meta.get('numero_documento')} · "
                             f"{len(parsed_items)} ítem(s) · {pyg(meta.get('total',0))}"
                         )
+                    elif meta.get("ocr_automatico"):
+                        if len(parsed_items) > 0:
+                            st.success(f"🔎 OCR automático: {meta.get('proveedor_sugerido')} · {len(parsed_items)} ítem(s) detectado(s).")
+                        else:
+                            st.warning("🔎 OCR leyó el documento, pero no pudo separar ítems con suficiente confianza. Revisá los datos antes de confirmar.")
                     elif normalize_text(meta.get("proveedor_sugerido")) == "TECNO ELECTRIC":
                         st.info("🏭 Proveedor detectado en este PDF: **TECNO ELECTRIC**")
                     observation=g.text_area("Observación", placeholder="Ej.: revisión 3, precio especial, factura escaneada...", key=f"obs_{digest}")
@@ -5413,6 +5516,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.11.0 Lote facturas junio 2026</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.12.0 OCR automático de escaneados</div>',
     unsafe_allow_html=True,
 )
