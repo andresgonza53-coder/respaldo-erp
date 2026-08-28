@@ -33,7 +33,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.9.8 - Normalización monetaria segura"
+APP_VERSION = "3.9.9 - Valores históricos confiables"
 
 
 st.markdown("""
@@ -1304,10 +1304,7 @@ def fetch_purchase_document_items(document_id, document_row=None):
 
         mq = re.search(r"Cantidad\s+([0-9.,]+)", obs, flags=re.I)
         if mq:
-            try:
-                qty = float(str(mq.group(1)).replace(",", "."))
-            except Exception:
-                qty = 1.0
+            qty = parse_quantity_from_history(mq.group(1))
 
         ms = re.search(r"Subtotal\s+([0-9.,]+)", obs, flags=re.I)
         if ms:
@@ -1417,9 +1414,24 @@ def normalize_text(value):
 
 
 def parse_money(value):
-    """Convierte importes PYG/internacionales a float de forma segura."""
+    """Convierte texto monetario a float sin reinterpretar números de la BD."""
     if value is None:
         return 0.0
+
+    # PostgreSQL numeric ya viene normalizado. Se respeta tal cual.
+    if isinstance(value, (int, float)):
+        try:
+            num = float(value)
+            return num if num == num else 0.0
+        except Exception:
+            return 0.0
+
+    try:
+        from decimal import Decimal
+        if isinstance(value, Decimal):
+            return float(value)
+    except Exception:
+        pass
 
     s = str(value).strip()
     if not s:
@@ -1441,49 +1453,38 @@ def parse_money(value):
         last_dot = s.rfind(".")
         last_comma = s.rfind(",")
         if last_comma > last_dot:
-            int_part = s[:last_comma].replace(".", "").replace(",", "")
-            dec_part = s[last_comma + 1:]
+            integer = s[:last_comma].replace(".", "").replace(",", "")
+            decimals = s[last_comma + 1:]
         else:
-            int_part = s[:last_dot].replace(",", "").replace(".", "")
-            dec_part = s[last_dot + 1:]
-        s = int_part + ("." + dec_part if dec_part else "")
+            integer = s[:last_dot].replace(",", "").replace(".", "")
+            decimals = s[last_dot + 1:]
+        s = integer + ("." + decimals if decimals else "")
 
     elif "," in s:
         parts = s.split(",")
-        if len(parts) > 2:
-            if all(len(p) == 3 for p in parts[1:]):
-                s = "".join(parts)
-            else:
-                s = "".join(parts[:-1]) + "." + parts[-1]
-        else:
+        if len(parts) > 2 and all(len(p) == 3 for p in parts[1:]):
+            s = "".join(parts)
+        elif len(parts) == 2:
             a, b = parts
-            if len(b) in (1, 2):
-                s = a + "." + b
-            elif len(b) == 3:
-                s = a + b
-            else:
-                s = a + "." + b
+            s = a + ("." + b if len(b) <= 2 else b)
+        else:
+            s = "".join(parts)
 
     elif "." in s:
         parts = s.split(".")
-        if len(parts) > 2:
-            if all(len(p) == 3 for p in parts[1:]):
-                s = "".join(parts)
-            else:
-                s = "".join(parts[:-1]) + "." + parts[-1]
-        else:
+        if len(parts) > 2 and all(len(p) == 3 for p in parts[1:]):
+            s = "".join(parts)
+        elif len(parts) == 2:
             a, b = parts
-            if len(b) == 3:
-                s = a + b
-            elif len(b) in (1, 2):
-                s = a + "." + b
-            else:
-                s = a + b
+            s = a + ("." + b if len(b) <= 2 else b)
+        else:
+            s = "".join(parts)
 
     try:
         num = float(s)
     except Exception:
         return 0.0
+
     return -num if negative else num
 
 
@@ -1508,12 +1509,25 @@ def looks_like_absurd_money(value, reference=None):
     if reference not in (None, "", 0):
         try:
             ref = float(reference)
-            if ref > 0 and val > ref * 1000:
+            if ref > 0 and val > ref * 100:
                 return True
         except Exception:
             pass
 
     return False
+
+
+def parse_quantity_from_history(value):
+    """Cantidad histórica fue guardada con formato :g, no como moneda."""
+    if value is None:
+        return 1.0
+    s = str(value).strip().replace(",", ".")
+    s = re.sub(r"[^0-9.\-]", "", s)
+    try:
+        q = float(s)
+        return q if q > 0 else 1.0
+    except Exception:
+        return 1.0
 
 
 
@@ -3682,7 +3696,7 @@ elif page == "🏷️ Stock":
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.9.8: normaliza importes PYG/internacionales y corrige valores absurdos antes de guardar.")
+    st.success("V3.9.9: respeta los valores numéricos de Supabase y valida el total reconstruido contra el total original del documento.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -3964,6 +3978,21 @@ elif page == "🔎 Compras / OCR":
                             suspicious_rows.append(str(idx_row))
                         total_calc += subtotal
                 st.metric("Total recalculado",pyg(total_calc))
+
+                original_total = parse_money(row.get("total", 0))
+                total_mismatch = False
+                if original_total > 0 and total_calc > 0:
+                    diff_ratio = abs(total_calc - original_total) / original_total
+                    total_mismatch = diff_ratio > 0.15
+                    if total_mismatch:
+                        st.error(
+                            "⛔ El total reconstruido no coincide con el total original. "
+                            f"Original: {pyg(original_total)} · Reconstruido: {pyg(total_calc)}. "
+                            "Revisá los ítems antes de guardar o aprobar."
+                        )
+                    else:
+                        st.success(f"✅ Total validado contra el original: {pyg(original_total)}")
+
                 if suspicious_rows:
                     st.warning(
                         f"⚠️ Se corrigieron automáticamente {len(suspicious_rows)} importe(s) sospechoso(s) "
@@ -3974,6 +4003,9 @@ elif page == "🔎 Compras / OCR":
                 if b1.button("💾 Guardar correcciones",use_container_width=True,key=f"m_save_{doc_id}"):
                     if looks_like_absurd_money(total_calc):
                         st.error("El total calculado es inválido o demasiado grande. Revisá cantidades y precios.")
+                        st.stop()
+                    if total_mismatch:
+                        st.error("No se guardó: el total de los ítems no coincide con el total original del documento.")
                         st.stop()
                     sid=row.get("proveedor_id")
                     if suppliers_admin is not None and not suppliers_admin.empty:
@@ -3986,12 +4018,15 @@ elif page == "🔎 Compras / OCR":
                     except Exception as exc:
                         st.error(f"No se pudo guardar: {exc}")
                 if b2.button("✅ Aprobar",use_container_width=True,key=f"m_ok_{doc_id}"):
-                    try:
-                        set_document_review_status(doc_id,"Revisado")
-                        st.success("Documento aprobado.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"No se pudo aprobar: {exc}")
+                    if total_mismatch:
+                        st.error("No se puede aprobar: primero corregí los ítems hasta que el total coincida.")
+                    else:
+                        try:
+                            set_document_review_status(doc_id,"Revisado")
+                            st.success("Documento aprobado.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"No se pudo aprobar: {exc}")
                 reason=st.text_input("Motivo de anulación",placeholder="Ej.: duplicado, proveedor equivocado...",key=f"m_reason_{doc_id}")
                 if b3.button("🚫 Anular",use_container_width=True,key=f"m_cancel_{doc_id}"):
                     try:
@@ -4391,6 +4426,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9.8 Normalización monetaria segura</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.9.9 Valores históricos confiables</div>',
     unsafe_allow_html=True,
 )
