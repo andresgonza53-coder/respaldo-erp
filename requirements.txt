@@ -5,5 +5,6 @@ supabase
 reportlab
 pypdf
 pymupdf
-rapidocr-onnxruntime
+rapidocr>=3.9.2
+onnxruntime>=1.26.0
 opencv-python-headless

@@ -16,9 +16,17 @@ from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
 
 try:
-    from rapidocr_onnxruntime import RapidOCR
+    # RapidOCR 3.x (paquete actual)
+    from rapidocr import RapidOCR
+    RAPIDOCR_BACKEND = "rapidocr"
 except Exception:
-    RapidOCR = None
+    try:
+        # Compatibilidad con instalaciones anteriores
+        from rapidocr_onnxruntime import RapidOCR
+        RAPIDOCR_BACKEND = "rapidocr_onnxruntime"
+    except Exception:
+        RapidOCR = None
+        RAPIDOCR_BACKEND = None
 
 try:
     import fitz
@@ -43,7 +51,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.12.0 - OCR automático de escaneados"
+APP_VERSION = "3.12.1 - OCR real y nombre de archivo corregido"
 
 
 st.markdown("""
@@ -1913,55 +1921,201 @@ def get_rapidocr_engine():
 
 
 def parse_purchase_filename(filename):
-    name=clean_display_value(filename)
-    stem=re.sub(r"\.pdf$","",name,flags=re.I)
-    parts=[p.strip() for p in stem.split("-")]
-    out={"proveedor":"","numero_corto":"","fecha":None}
-    if len(parts)>=4 and normalize_text(parts[0])=="COMPRA":
-        mmdd=re.sub(r"\D","",parts[1]); number=re.sub(r"\D","",parts[2])
-        out["proveedor"]=parts[3].strip().upper(); out["numero_corto"]=number
-        if len(mmdd)==4:
-            try: out["fecha"]=date(2026,int(mmdd[:2]),int(mmdd[2:]))
-            except Exception: pass
+    """Lee nombres del tipo:
+    COMPRA - 0630 - 0009897 - ELECTROPAR.pdf
+
+    0630     -> 30/06/2026
+    0009897  -> número corto del comprobante
+    ELECTROPAR -> proveedor
+    """
+    name = clean_display_value(filename)
+    stem = re.sub(r"\.pdf$", "", name, flags=re.I)
+    parts = [p.strip() for p in stem.split("-")]
+
+    out = {
+        "proveedor": "",
+        "numero_corto": "",
+        "fecha": None,
+        "valido": False,
+    }
+
+    if len(parts) < 4 or normalize_text(parts[0]) != "COMPRA":
+        return out
+
+    mmdd = re.sub(r"\D", "", parts[1])
+    number = re.sub(r"\D", "", parts[2])
+    provider = clean_display_value(parts[3]).upper()
+
+    if len(mmdd) == 4:
+        try:
+            month = int(mmdd[:2])
+            day = int(mmdd[2:])
+            out["fecha"] = date(2026, month, day)
+        except Exception:
+            out["fecha"] = None
+
+    out["numero_corto"] = number
+    out["proveedor"] = provider
+    out["valido"] = bool(out["fecha"] and number and provider)
     return out
 
 
-def ocr_pdf_image(uploaded_file,max_pages=2,zoom=2.2):
+
+def _rapidocr_lines(result):
+    """Normaliza salida de RapidOCR 3.x y rapidocr_onnxruntime antiguo."""
+    lines = []
+
+    if result is None:
+        return lines
+
+    # RapidOCR 3.x: RapidOCROutput con .txts / .scores
+    txts = getattr(result, "txts", None)
+    scores = getattr(result, "scores", None)
+    if txts is not None:
+        txts = list(txts or [])
+        scores = list(scores or [])
+        for idx, txt in enumerate(txts):
+            score = float(scores[idx]) if idx < len(scores) and scores[idx] is not None else 1.0
+            clean = clean_display_value(txt)
+            if clean and score >= 0.30:
+                lines.append(clean)
+        return lines
+
+    # Algunas versiones devuelven dict-like
+    if isinstance(result, dict):
+        txts = result.get("txts") or result.get("texts") or []
+        scores = result.get("scores") or []
+        for idx, txt in enumerate(txts):
+            score = float(scores[idx]) if idx < len(scores) and scores[idx] is not None else 1.0
+            clean = clean_display_value(txt)
+            if clean and score >= 0.30:
+                lines.append(clean)
+        return lines
+
+    # rapidocr_onnxruntime antiguo: lista [box, text, score]
+    if isinstance(result, (list, tuple)):
+        # Puede venir como (result, elapsed)
+        candidate = result
+        if len(result) == 2 and isinstance(result[0], (list, tuple)) and not isinstance(result[0], str):
+            candidate = result[0]
+
+        for row in candidate or []:
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            clean = clean_display_value(row[1])
+            try:
+                score = float(row[2]) if len(row) > 2 and row[2] is not None else 1.0
+            except Exception:
+                score = 1.0
+            if clean and score >= 0.30:
+                lines.append(clean)
+
+    return lines
+
+
+def ocr_pdf_image(uploaded_file, max_pages=2, zoom=2.6):
+    """OCR real para PDF escaneado.
+
+    Renderiza cada página con PyMuPDF y ejecuta RapidOCR.
+    Devuelve texto y diagnóstico visible en la app.
+    """
     if fitz is None:
-        return "",{"ok":False,"reason":"PyMuPDF no disponible"}
-    engine=get_rapidocr_engine()
+        return "", {
+            "ok": False,
+            "reason": "PyMuPDF no disponible",
+            "backend": RAPIDOCR_BACKEND,
+        }
+
+    engine = get_rapidocr_engine()
     if engine is None:
-        return "",{"ok":False,"reason":"RapidOCR no disponible"}
-    try: doc=fitz.open(stream=uploaded_file.getvalue(),filetype="pdf")
-    except Exception as exc: return "",{"ok":False,"reason":str(exc)}
-    all_lines=[]; dbg=[]
+        return "", {
+            "ok": False,
+            "reason": "RapidOCR no pudo inicializarse",
+            "backend": RAPIDOCR_BACKEND,
+        }
+
     try:
-        for pno in range(min(len(doc),max_pages)):
-            page=doc.load_page(pno)
-            pix=page.get_pixmap(matrix=fitz.Matrix(zoom,zoom),alpha=False)
-            try: result,_=engine(pix.tobytes("png"))
+        raw_pdf = uploaded_file.getvalue()
+        doc = fitz.open(stream=raw_pdf, filetype="pdf")
+    except Exception as exc:
+        return "", {
+            "ok": False,
+            "reason": f"No se pudo abrir el PDF: {exc}",
+            "backend": RAPIDOCR_BACKEND,
+        }
+
+    all_lines = []
+    page_debug = []
+
+    try:
+        for pno in range(min(len(doc), max_pages)):
+            page = doc.load_page(pno)
+            pix = page.get_pixmap(
+                matrix=fitz.Matrix(zoom, zoom),
+                alpha=False
+            )
+            img_bytes = pix.tobytes("png")
+
+            try:
+                output = engine(img_bytes)
+                lines = _rapidocr_lines(output)
             except Exception as exc:
-                dbg.append({"page":pno+1,"error":str(exc)}); continue
-            lines=[]
-            for row in result or []:
-                if len(row)<2: continue
-                txt=clean_display_value(row[1]); score=float(row[2]) if len(row)>2 and row[2] is not None else 0
-                if txt and score>=0.35: lines.append(txt)
-            all_lines.extend(lines); dbg.append({"page":pno+1,"lines":len(lines)})
-    finally: doc.close()
-    raw="\n".join(all_lines)
-    return raw,{"ok":bool(raw.strip()),"pages":dbg,"chars":len(raw),"lines":len(all_lines)}
+                page_debug.append({
+                    "page": pno + 1,
+                    "lines": 0,
+                    "error": str(exc),
+                })
+                continue
+
+            all_lines.extend(lines)
+            page_debug.append({
+                "page": pno + 1,
+                "lines": len(lines),
+            })
+    finally:
+        doc.close()
+
+    raw = "\n".join(all_lines).strip()
+
+    return raw, {
+        "ok": bool(raw),
+        "backend": RAPIDOCR_BACKEND,
+        "pages": page_debug,
+        "chars": len(raw),
+        "lines": len(all_lines),
+        "reason": "" if raw else "OCR ejecutado pero no devolvió texto",
+    }
 
 
-def enrich_meta_from_filename(meta,uploaded_file):
-    info=parse_purchase_filename(getattr(uploaded_file,"name",""))
-    if not clean_display_value(meta.get("proveedor_sugerido")) and info.get("proveedor"):
-        meta["proveedor_sugerido"]=info["proveedor"]
-    num=clean_display_value(meta.get("numero_documento"))
-    if (not num or len(re.sub(r"\D","",num))<4) and info.get("numero_corto"):
-        meta["numero_documento"]=info["numero_corto"]
-    if not meta.get("fecha") and info.get("fecha"): meta["fecha"]=info["fecha"]
+
+def enrich_meta_from_filename(meta, uploaded_file):
+    """Completa/corrige metadatos usando el estándar del nombre del archivo.
+
+    Para archivos COMPRA - MMDD - NUMERO - PROVEEDOR.pdf el nombre se considera
+    una fuente confiable de fecha, número corto y proveedor.
+    """
+    info = parse_purchase_filename(getattr(uploaded_file, "name", ""))
+
+    if not info.get("valido"):
+        return meta
+
+    # Proveedor y fecha vienen explícitamente del nombre del archivo.
+    meta["proveedor_sugerido"] = info["proveedor"]
+    meta["fecha"] = info["fecha"]
+
+    detected_number = clean_display_value(meta.get("numero_documento"))
+    detected_digits = re.sub(r"\D", "", detected_number)
+    short_number = info["numero_corto"]
+
+    # Si el PDF leyó el número completo (ej. 001-005-0051750), conservarlo
+    # siempre que termine en el número del archivo. De lo contrario usar el
+    # número corto correcto, nunca MMDD.
+    if not detected_digits.endswith(short_number):
+        meta["numero_documento"] = short_number
+
+    meta["nombre_archivo_validado"] = True
     return meta
+
 
 
 def normalize_ocr_provider_name(name):
@@ -3489,6 +3643,17 @@ def parse_supplier_pdf(uploaded_file):
     }
     meta = enrich_meta_from_filename(meta, uploaded_file)
     meta["proveedor_sugerido"] = normalize_ocr_provider_name(meta.get("proveedor_sugerido"))
+
+    filename_info = parse_purchase_filename(uploaded_file.name)
+    if filename_info.get("valido") and (
+        not clean_display_value(meta.get("tipo_documento"))
+        or (
+            clean_display_value(meta.get("tipo_documento")) == "Presupuesto"
+            and len(clean_items) == 0
+        )
+    ):
+        meta["tipo_documento"] = "Factura"
+
     if used_ocr:
         meta["parser_usado"] = f"OCR + {best_name}"
         meta["requiere_ocr"] = False if len(clean_items) > 0 else True
@@ -4444,7 +4609,7 @@ elif page == "🏷️ Stock":
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.12.0: además del lote validado, intenta OCR automático en nuevas facturas escaneadas y usa el nombre del archivo como respaldo de proveedor, fecha y número.")
+    st.success("V3.12.1: corrige el motor OCR para RapidOCR actual y el nombre COMPRA-MMDD-NÚMERO-PROVEEDOR ahora fija correctamente fecha, número y proveedor.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -5516,6 +5681,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.12.0 OCR automático de escaneados</div>',
+    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.12.1 OCR real y nombre corregido</div>',
     unsafe_allow_html=True,
 )
