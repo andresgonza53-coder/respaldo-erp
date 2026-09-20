@@ -51,7 +51,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.12.1 - OCR real y nombre de archivo corregido"
+APP_VERSION = "4.0.0 - Pulso AG | Gestión industrial 360"
 
 
 st.markdown("""
@@ -4012,27 +4012,445 @@ def update_supplier(supplier_id, name, ruc="", contacto="", telefono="", correo=
     }).eq("id",supplier_id).execute()
 
 
+
+# ============================================================
+# AGENDA / PROYECTOS / SEGUIMIENTO DE PRESUPUESTOS
+# ============================================================
+WEEKDAY_ES = {
+    0: "LUNES", 1: "MARTES", 2: "MIERCOLES", 3: "JUEVES",
+    4: "VIERNES", 5: "SABADO", 6: "DOMINGO",
+}
+
+PRIORITY_MATRIX = {
+    "HACER": ["VISITA", "VIDEOS", "PRESUPUESTO", "SEGUIMIENTO", "RELEVAMIENTO"],
+    "DECIDIR": [
+        "CONTENIDO DE VIDEOS", "LISTA DE CLIENTES ASO EXA", "PUBLICO OBJETIVO",
+        "NUEVOS SERVICIOS", "MEJORAR SERVICIO ACTUALES", "ENSEÑAR TECNICOS",
+        "NUEVOS INGRESOS", "PLANEAR"
+    ],
+    "DELEGAR": ["COTIZACIONES", "ENTREGA DE MERCADERIAS", "RETIRO DE MERCADERIAS", "ENTREGA DE FACTURAS", "COBROS"],
+    "ELIMINAR": ["CRM", "REUNIONES"],
+}
+
+
+def _safe_table(name, select="*", order=None, desc=False):
+    try:
+        q = supabase.table(name).select(select)
+        if order:
+            q = q.order(order, desc=desc)
+        return q.execute().data or []
+    except Exception:
+        return []
+
+
+def fetch_agenda_tasks():
+    return pd.DataFrame(_safe_table("agenda_tareas", "*", "fecha", False))
+
+
+def fetch_projects():
+    return pd.DataFrame(_safe_table("proyectos", "*", "creado_en", True))
+
+
+def fetch_project_tasks(project_id=None):
+    try:
+        q = supabase.table("proyecto_tareas").select("*,proyectos(nombre)")
+        if project_id:
+            q = q.eq("proyecto_id", project_id)
+        return pd.DataFrame(q.order("fecha_fin").execute().data or [])
+    except Exception:
+        return pd.DataFrame()
+
+
+def fetch_budget_tracking():
+    return pd.DataFrame(_safe_table("seguimiento_presupuestos", "*", "creado_en", True))
+
+
+def save_agenda_task(payload):
+    return supabase.table("agenda_tareas").insert(payload).execute()
+
+
+def update_agenda_task(task_id, payload):
+    return supabase.table("agenda_tareas").update(payload).eq("id", task_id).execute()
+
+
+def delete_agenda_task(task_id):
+    return supabase.table("agenda_tareas").delete().eq("id", task_id).execute()
+
+
+def save_project(payload):
+    return supabase.table("proyectos").insert(payload).execute()
+
+
+def save_project_task(payload):
+    return supabase.table("proyecto_tareas").insert(payload).execute()
+
+
+def update_project_task(task_id, payload):
+    return supabase.table("proyecto_tareas").update(payload).eq("id", task_id).execute()
+
+
+def normalize_excel_date(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    try:
+        if isinstance(value, (datetime, date, pd.Timestamp)):
+            return pd.to_datetime(value).date()
+        if isinstance(value, (int, float)) and 20000 < float(value) < 70000:
+            return (pd.Timestamp("1899-12-30") + pd.to_timedelta(float(value), unit="D")).date()
+        return pd.to_datetime(value).date()
+    except Exception:
+        return None
+
+
+def excel_time_to_text(value):
+    try:
+        if isinstance(value, (datetime, pd.Timestamp)):
+            return value.strftime("%H:%M")
+        if isinstance(value, str) and ":" in value:
+            return value[:5]
+        f = float(value)
+        if 0 <= f < 1:
+            mins = int(round(f * 24 * 60))
+            return f"{mins//60:02d}:{mins%60:02d}"
+    except Exception:
+        pass
+    return ""
+
+
+def parse_daily_excel(uploaded_file):
+    """Convierte 1-DIARIO en rutina semanal + matriz de prioridades."""
+    xls = pd.ExcelFile(uploaded_file)
+    sheet = "Hoja1" if "Hoja1" in xls.sheet_names else xls.sheet_names[0]
+    df = pd.read_excel(uploaded_file, sheet_name=sheet, header=None)
+
+    routines = []
+    current_days = {}
+    for r in range(len(df)):
+        row = df.iloc[r].tolist()
+
+        # Filas que declaran días: LUNES, MARTES, ...
+        for c, value in enumerate(row):
+            day = normalize_text(value)
+            if day in set(WEEKDAY_ES.values()):
+                current_days[c] = day
+
+        # Cada bloque de actividad usa H / TAREA / ACTIVIDAD.
+        for c in range(0, max(len(row)-2, 0)):
+            if c not in current_days:
+                continue
+            h = row[c]
+            code = row[c+1] if c+1 < len(row) else None
+            activity = row[c+2] if c+2 < len(row) else None
+            hour = excel_time_to_text(h)
+            act = clean_display_value(activity)
+            task_code = clean_display_value(code)
+            if hour and act and normalize_text(act) not in {"ACTIVIDAD"}:
+                routines.append({
+                    "dia_semana": current_days[c],
+                    "hora": hour,
+                    "categoria": task_code or "R",
+                    "titulo": act,
+                })
+
+    # Quitar duplicados exactos por día/hora/actividad.
+    seen, clean_rows = set(), []
+    for r in routines:
+        key = (r["dia_semana"], r["hora"], normalize_text(r["titulo"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        clean_rows.append(r)
+    return pd.DataFrame(clean_rows)
+
+
+def parse_budget_tracking_excel(uploaded_file):
+    df = pd.read_excel(uploaded_file, sheet_name=0, header=None)
+    section = None
+    out = []
+
+    mapping = {
+        "COTIZADOS": "Cotizado",
+        "APROBADOS": "Aprobado",
+        "A COTIZAR": "A cotizar",
+    }
+
+    for _, row in df.iterrows():
+        name = clean_display_value(row.iloc[0] if len(row) else "")
+        value = row.iloc[1] if len(row) > 1 else None
+        key = normalize_text(name)
+
+        if key in mapping:
+            section = mapping[key]
+            continue
+
+        if not name or not section:
+            continue
+
+        # Ignorar filas de subtotal sin cliente.
+        if key in {"NAN", "NONE"}:
+            continue
+
+        amount = 0.0
+        try:
+            if pd.notna(value):
+                amount = float(value)
+        except Exception:
+            amount = 0.0
+
+        # Las filas con nombre son clientes; subtotales tienen A vacío y ya se excluyen.
+        out.append({
+            "cliente": name.strip(),
+            "estado": section,
+            "monto": amount,
+        })
+
+    return pd.DataFrame(out)
+
+
+def parse_project_schedule_excel(uploaded_file):
+    df = pd.read_excel(uploaded_file, sheet_name="ProjectSchedule", header=None)
+    projects = []
+    tasks = []
+    current_project = None
+
+    for r in range(7, len(df)):
+        name = clean_display_value(df.iloc[r, 1] if df.shape[1] > 1 else "")
+        assigned = clean_display_value(df.iloc[r, 2] if df.shape[1] > 2 else "")
+        progress_raw = df.iloc[r, 3] if df.shape[1] > 3 else None
+        start_raw = df.iloc[r, 4] if df.shape[1] > 4 else None
+        end_raw = df.iloc[r, 5] if df.shape[1] > 5 else None
+
+        if not name:
+            continue
+        if normalize_text(name).startswith("INSERTE NUEVAS FILAS"):
+            continue
+
+        has_task_fields = bool(assigned) or pd.notna(progress_raw) or pd.notna(start_raw) or pd.notna(end_raw)
+
+        if not has_task_fields:
+            current_project = name.strip()
+            projects.append(current_project)
+            continue
+
+        if current_project is None:
+            current_project = "SIN PROYECTO"
+            projects.append(current_project)
+
+        try:
+            progress = float(progress_raw or 0)
+        except Exception:
+            progress = 0.0
+
+        tasks.append({
+            "proyecto": current_project,
+            "tarea": name.strip(),
+            "asignado_a": assigned or "Andrés",
+            "progreso": max(0.0, min(progress, 1.0)),
+            "fecha_inicio": normalize_excel_date(start_raw),
+            "fecha_fin": normalize_excel_date(end_raw),
+        })
+
+    return list(dict.fromkeys(projects)), pd.DataFrame(tasks)
+
+
+def migrate_daily_to_db(routines_df):
+    inserted = 0
+    for _, r in routines_df.iterrows():
+        payload = {
+            "titulo": clean_display_value(r.get("titulo")),
+            "categoria": clean_display_value(r.get("categoria")) or "Rutina",
+            "estado": "Pendiente",
+            "prioridad": "Normal",
+            "dia_semana": clean_display_value(r.get("dia_semana")),
+            "hora": clean_display_value(r.get("hora")) or None,
+            "recurrente": True,
+            "origen": "1- DIARIO.xlsx",
+        }
+        # Evitar duplicados por día/hora/título.
+        existing = (
+            supabase.table("agenda_tareas").select("id")
+            .eq("titulo", payload["titulo"])
+            .eq("dia_semana", payload["dia_semana"])
+            .eq("hora", payload["hora"])
+            .limit(1).execute().data or []
+        )
+        if not existing:
+            supabase.table("agenda_tareas").insert(payload).execute()
+            inserted += 1
+    return inserted
+
+
+def migrate_budget_tracking_to_db(df):
+    inserted = 0
+    for _, r in df.iterrows():
+        payload = {
+            "cliente": clean_display_value(r.get("cliente")),
+            "estado": clean_display_value(r.get("estado")),
+            "monto": float(r.get("monto", 0) or 0),
+            "responsable": "Andrés",
+            "origen": "2 - PRESUPUESTO ABIERTOS CERRADO PENDIENTES.xlsx",
+        }
+        existing = (
+            supabase.table("seguimiento_presupuestos").select("id")
+            .ilike("cliente", payload["cliente"])
+            .eq("estado", payload["estado"])
+            .limit(1).execute().data or []
+        )
+        if existing:
+            supabase.table("seguimiento_presupuestos").update(payload).eq("id", existing[0]["id"]).execute()
+        else:
+            supabase.table("seguimiento_presupuestos").insert(payload).execute()
+            inserted += 1
+    return inserted
+
+
+def migrate_projects_to_db(project_names, tasks_df):
+    project_ids = {}
+    created_projects = 0
+    created_tasks = 0
+
+    for pname in project_names:
+        existing = supabase.table("proyectos").select("id").ilike("nombre", pname).limit(1).execute().data or []
+        if existing:
+            project_ids[pname] = existing[0]["id"]
+        else:
+            res = supabase.table("proyectos").insert({
+                "nombre": pname,
+                "estado": "Activo",
+                "responsable": "Andrés",
+                "origen": "3 - Cronograma Andres gonzalez.xlsx",
+            }).execute()
+            project_ids[pname] = res.data[0]["id"]
+            created_projects += 1
+
+    for _, r in tasks_df.iterrows():
+        pid = project_ids.get(r.get("proyecto"))
+        if not pid:
+            continue
+        task_name = clean_display_value(r.get("tarea"))
+        existing = (
+            supabase.table("proyecto_tareas").select("id")
+            .eq("proyecto_id", pid).ilike("tarea", task_name).limit(1).execute().data or []
+        )
+        payload = {
+            "proyecto_id": pid,
+            "tarea": task_name,
+            "asignado_a": clean_display_value(r.get("asignado_a")) or "Andrés",
+            "progreso": float(r.get("progreso", 0) or 0),
+            "fecha_inicio": r.get("fecha_inicio").isoformat() if r.get("fecha_inicio") else None,
+            "fecha_fin": r.get("fecha_fin").isoformat() if r.get("fecha_fin") else None,
+            "estado": "Completado" if float(r.get("progreso", 0) or 0) >= 1 else "Pendiente",
+            "origen": "3 - Cronograma Andres gonzalez.xlsx",
+        }
+        if existing:
+            supabase.table("proyecto_tareas").update(payload).eq("id", existing[0]["id"]).execute()
+        else:
+            supabase.table("proyecto_tareas").insert(payload).execute()
+            created_tasks += 1
+
+    return created_projects, created_tasks
+
+
+def today_agenda_rows():
+    df = fetch_agenda_tasks()
+    if df.empty:
+        return df
+    today = date.today()
+    day = WEEKDAY_ES[today.weekday()]
+    dated = df["fecha"].astype(str).eq(today.isoformat()) if "fecha" in df.columns else pd.Series(False, index=df.index)
+    recurring = (
+        df.get("recurrente", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+        & df.get("dia_semana", pd.Series("", index=df.index)).astype(str).str.upper().eq(day)
+    )
+    return df[dated | recurring].copy()
+
+
+def project_due_rows():
+    df = fetch_project_tasks()
+    if df.empty:
+        return df
+    today = pd.Timestamp(date.today())
+    end = pd.to_datetime(df.get("fecha_fin"), errors="coerce")
+    state = df.get("estado", pd.Series("", index=df.index)).astype(str)
+    return df[(end <= today) & ~state.str.lower().eq("completado")].copy()
+
+
+
+
+# ============================================================
+# PULSO AG - SERVICIOS Y ORDENES DE TRABAJO
+# ============================================================
+PULSO_SERVICES = [
+    "Automatización PLC / HMI / SCADA",
+    "Variadores / Arranque / Control de motores",
+    "Medición y gestión de energía",
+    "Calidad de energía",
+    "Termografía eléctrica",
+    "Mantenimiento eléctrico industrial",
+    "Instrumentación y sensores",
+    "Aire comprimido / Neumática",
+    "Compresores",
+    "Planta de agua",
+    "Planta de efluentes",
+    "Calderas y servicios auxiliares",
+    "Redes industriales / Comunicación",
+    "Capacitación técnica",
+    "Ingeniería / Relevamiento / Planos",
+    "Otro servicio industrial",
+]
+OT_STATES = ["Pendiente","Programada","En ejecución","Esperando material",
+             "Esperando cliente","Terminada","Facturada","Cobrada","Cancelada"]
+
+def pulso_money(value):
+    try:
+        return f"Gs. {float(value or 0):,.0f}".replace(",", ".")
+    except Exception:
+        return "Gs. 0"
+
+def fetch_work_orders():
+    return pd.DataFrame(_safe_table("ordenes_trabajo", "*", "creado_en", True))
+
+def save_work_order(payload):
+    return supabase.table("ordenes_trabajo").insert(payload).execute()
+
+def update_work_order(ot_id, payload):
+    return supabase.table("ordenes_trabajo").update(payload).eq("id", ot_id).execute()
+
+def fetch_ot_costs(ot_id=None):
+    try:
+        q = supabase.table("ot_costos").select("*")
+        if ot_id:
+            q = q.eq("ot_id", ot_id)
+        return pd.DataFrame(q.order("creado_en", desc=True).execute().data or [])
+    except Exception:
+        return pd.DataFrame()
+
+def fetch_pulso_services():
+    return pd.DataFrame(_safe_table("servicios_pulso", "*", "nombre", False))
+
+
 # ============================================================
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown('<div class="brand">⚡ Respaldo<br>Industrial SRL</div>', unsafe_allow_html=True)
+    st.markdown('<div class="brand">⚡ PULSO AG</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="brand-sub">{APP_VERSION}</div>', unsafe_allow_html=True)
 
     page = st.radio(
         "Navegación",
         [
             "🏠 Inicio",
-            "🤝 CRM",
+            "🤝 Comercial / CRM",
             "👥 Clientes",
             "📄 Presupuestos",
-            "🛒 Ventas",
-            "📦 Productos",
+            "🧰 Órdenes de trabajo",
+            "📅 Agenda / Mi día",
+            "📋 Proyectos",
+            "⚙️ Servicios",
             "🏷️ Stock",
             "🔎 Compras / OCR",
             "🏭 Proveedores / Materiales",
-            "💵 Caja",
-            "💳 Cuentas",
+            "💵 Finanzas / Caja",
             "📊 Reportes",
             "⬆️ Importar Excel",
             "⚙️ Configuración",
@@ -4055,7 +4473,8 @@ with st.sidebar:
 # DASHBOARD
 # ============================================================
 if page == "🏠 Inicio":
-    page_header("Dashboard", "Resumen general del negocio")
+    page_header("Pulso AG", "Centro de control comercial, técnico y financiero")
+    st.info("Prospecto → Relevamiento → Presupuesto → Aprobación → OT / Proyecto → Compras → Ejecución → Informe → Facturación → Cobro → Posventa")
 
     imported_crm = st.session_state.imported_stats
     crm_total = imported_crm.get("clientes") if imported_crm else None
@@ -4132,8 +4551,8 @@ if page == "🏠 Inicio":
         st.markdown('<div class="soft-panel">', unsafe_allow_html=True)
         st.markdown('<div class="panel-title">Estado de implementación</div>', unsafe_allow_html=True)
         progress_df = pd.DataFrame({
-            "Módulo": ["Dashboard", "CRM", "Presupuestos", "Caja", "Productos/Stock", "Compras/OCR", "Base de datos"],
-            "Estado": ["Prototipo", "Prototipo", "Prototipo", "Prototipo", "Prototipo", "Pendiente integración", "Pendiente"],
+            "Módulo": ["Dashboard", "CRM", "Presupuestos", "Agenda", "Proyectos", "Caja", "Productos/Stock", "Compras/OCR", "Base de datos"],
+            "Estado": ["Activo", "Activo", "Activo", "Nuevo V3.13", "Nuevo V3.13", "Prototipo", "Prototipo", "Activo", "Supabase"],
         })
         st.dataframe(progress_df, hide_index=True, use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
@@ -4142,7 +4561,7 @@ if page == "🏠 Inicio":
 # ============================================================
 # CRM
 # ============================================================
-elif page == "🤝 CRM":
+elif page == "🤝 Comercial / CRM":
     page_header("CRM", "Seguimiento comercial persistente en Supabase")
 
     clients_db, crm_df = fetch_crm_from_db()
@@ -4352,8 +4771,9 @@ elif page == "📄 Presupuestos":
     quotes_df = fetch_quotes()
     clients_db, _ = fetch_crm_from_db()
 
-    tab_list, tab_new, tab_cost, tab_pdf = st.tabs([
-        "📋 Mis presupuestos", "➕ Nuevo presupuesto", "🧮 Costeo interno", "📄 Vista previa / PDF"
+    tab_list, tab_new, tab_cost, tab_pdf, tab_tracking = st.tabs([
+        "📋 Mis presupuestos", "➕ Nuevo presupuesto", "🧮 Costeo interno",
+        "📄 Vista previa / PDF", "📌 Seguimiento histórico"
     ])
 
     with tab_list:
@@ -4560,6 +4980,320 @@ elif page == "📄 Presupuestos":
 # ============================================================
 # VENTAS
 # ============================================================
+
+    with tab_tracking:
+        tracking_df = fetch_budget_tracking()
+        if tracking_df.empty:
+            st.info("Todavía no hay datos históricos. Importá el Excel de presupuestos desde **Importar Excel**.")
+        else:
+            t = tracking_df.copy()
+            t["monto"] = pd.to_numeric(t.get("monto"), errors="coerce").fillna(0)
+            cotizado = float(t.loc[t["estado"].eq("Cotizado"), "monto"].sum())
+            aprobado = float(t.loc[t["estado"].eq("Aprobado"), "monto"].sum())
+            pendientes = int(t["estado"].eq("A cotizar").sum())
+
+            k1,k2,k3 = st.columns(3)
+            k1.metric("Cotizado histórico", pyg(cotizado))
+            k2.metric("Aprobado histórico", pyg(aprobado))
+            k3.metric("Pendientes a cotizar", pendientes)
+
+            view_cols = [c for c in ["cliente","estado","monto","responsable","observacion"] if c in t.columns]
+            view = t[view_cols].rename(columns={
+                "cliente":"Cliente","estado":"Estado","monto":"Monto",
+                "responsable":"Responsable","observacion":"Observación"
+            })
+            if "Monto" in view.columns:
+                view["Monto"] = view["Monto"].apply(lambda x: pyg(x) if float(x or 0) else "")
+            st.dataframe(view, hide_index=True, use_container_width=True)
+
+
+
+# ============================================================
+# AGENDA / MI DÍA
+# ============================================================
+elif page == "📅 Agenda / Mi día":
+    page_header("Agenda / Mi día", "Rutina, prioridades y pendientes en una sola vista")
+
+    today = date.today()
+    today_name = WEEKDAY_ES[today.weekday()].title()
+    agenda_today = today_agenda_rows()
+    due_projects = project_due_rows()
+
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Hoy", f"{today_name} {today.strftime('%d/%m')}")
+    c2.metric("Actividades de hoy", len(agenda_today))
+    c3.metric("Tareas de proyecto vencen/vencidas", len(due_projects))
+    c4.metric("Pendientes totales", int((fetch_agenda_tasks().get("estado", pd.Series(dtype=str)).astype(str) != "Completado").sum()) if not fetch_agenda_tasks().empty else 0)
+
+    tab_today, tab_tasks, tab_matrix = st.tabs(["🗓️ Hoy", "✅ Tareas", "🎯 Prioridades"])
+
+    with tab_today:
+        st.markdown("### Plan del día")
+        if agenda_today.empty:
+            st.info("No hay rutina ni tareas específicas para hoy. Importá **1- DIARIO.xlsx** o agregá una tarea.")
+        else:
+            show = agenda_today.copy()
+            cols = [c for c in ["hora","titulo","categoria","prioridad","estado","cliente"] if c in show.columns]
+            show = show[cols].rename(columns={
+                "hora":"Hora","titulo":"Actividad","categoria":"Tipo","prioridad":"Prioridad","estado":"Estado","cliente":"Cliente"
+            })
+            st.dataframe(show, hide_index=True, use_container_width=True)
+
+        if not due_projects.empty:
+            st.markdown("### ⚠️ Proyectos que requieren atención")
+            due = due_projects.copy()
+            due["Proyecto"] = due["proyectos"].apply(lambda x: x.get("nombre","") if isinstance(x,dict) else "")
+            due["Progreso"] = (pd.to_numeric(due["progreso"], errors="coerce").fillna(0)*100).round(0).astype(int).astype(str)+"%"
+            st.dataframe(
+                due[[c for c in ["Proyecto","tarea","asignado_a","fecha_fin","Progreso"] if c in due.columns]].rename(columns={
+                    "tarea":"Tarea","asignado_a":"Responsable","fecha_fin":"Fin"
+                }),
+                hide_index=True, use_container_width=True
+            )
+
+    with tab_tasks:
+        st.markdown("### Nueva tarea")
+        a,b,c = st.columns([2,1,1])
+        title = a.text_input("Tarea", key="agenda_title")
+        category = b.selectbox("Tipo", ["PRESUPUESTO","VISITA","SEGUIMIENTO","RELEVAMIENTO","LLAMADA","ADMIN","PERSONAL","OTRO"], key="agenda_cat")
+        priority = c.selectbox("Prioridad", ["Alta","Normal","Baja"], key="agenda_priority")
+        d,e,f = st.columns(3)
+        task_date = d.date_input("Fecha", today, key="agenda_date")
+        task_time = e.time_input("Hora", datetime.now().time().replace(second=0, microsecond=0), key="agenda_time")
+        client = f.text_input("Cliente / referencia", key="agenda_client")
+        note = st.text_area("Observación", key="agenda_note")
+
+        if st.button("➕ Agregar a mi agenda", type="primary", use_container_width=True):
+            if not title.strip():
+                st.warning("Escribí la tarea.")
+            else:
+                try:
+                    save_agenda_task({
+                        "titulo": title.strip(),
+                        "categoria": category,
+                        "prioridad": priority,
+                        "estado": "Pendiente",
+                        "fecha": task_date.isoformat(),
+                        "hora": task_time.strftime("%H:%M"),
+                        "cliente": client.strip() or None,
+                        "observacion": note.strip() or None,
+                        "recurrente": False,
+                        "origen": "ERP",
+                    })
+                    st.success("Tarea agregada.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error("No se pudo guardar la tarea. Ejecutá primero el SQL de V3.13.0 si todavía no creaste las tablas.")
+                    st.caption(str(exc))
+
+        all_tasks = fetch_agenda_tasks()
+        if not all_tasks.empty:
+            st.markdown("### Tareas cargadas")
+            task_view = all_tasks.copy()
+            cols = [c for c in ["fecha","hora","titulo","categoria","prioridad","estado","cliente"] if c in task_view.columns]
+            st.dataframe(task_view[cols], hide_index=True, use_container_width=True)
+
+    with tab_matrix:
+        st.markdown("### Matriz de prioridades")
+        st.caption("Importada del esquema HACER / DECIDIR / DELEGAR / ELIMINAR del archivo Diario.")
+        cols = st.columns(4)
+        for col, quadrant in zip(cols, ["HACER","DECIDIR","DELEGAR","ELIMINAR"]):
+            with col:
+                st.markdown(f"#### {quadrant}")
+                for item in PRIORITY_MATRIX[quadrant]:
+                    st.write(f"• {item}")
+
+
+# ============================================================
+# PROYECTOS
+# ============================================================
+
+# ============================================================
+# ORDENES DE TRABAJO - PULSO AG
+# ============================================================
+elif page == "🧰 Órdenes de trabajo":
+    page_header("Órdenes de trabajo", "Ejecución, costos, margen, facturación y cobro")
+
+    tab1, tab2, tab3 = st.tabs(["📋 Tablero", "➕ Nueva OT", "💰 Costos / Margen"])
+    ots = fetch_work_orders()
+
+    with tab1:
+        if ots.empty:
+            st.info("Todavía no hay órdenes de trabajo. Creá la primera OT.")
+        else:
+            a,b = st.columns(2)
+            sf = a.selectbox("Estado", ["Todos"] + OT_STATES, key="pulso_ot_filter")
+            search = b.text_input("Buscar cliente / servicio", key="pulso_ot_search")
+            view = ots.copy()
+            if sf != "Todos":
+                view = view[view["estado"].astype(str).eq(sf)]
+            if search.strip():
+                q = search.lower().strip()
+                view = view[view.apply(lambda r: q in " ".join(r.astype(str)).lower(), axis=1)]
+            cols = [c for c in ["numero_ot","cliente","planta","servicio","estado","fecha_programada","responsable","precio_venta"] if c in view.columns]
+            show = view[cols].copy()
+            if "precio_venta" in show:
+                show["precio_venta"] = show["precio_venta"].apply(pulso_money)
+            st.dataframe(show, hide_index=True, use_container_width=True)
+
+            if not view.empty:
+                opts = {f'{r.get("numero_ot","OT")} · {r.get("cliente","")}': r["id"] for _,r in view.iterrows()}
+                chosen = st.selectbox("Actualizar OT", list(opts.keys()), key="pulso_ot_open")
+                row = view[view["id"].astype(str).eq(str(opts[chosen]))].iloc[0]
+                c1,c2 = st.columns(2)
+                old_state = str(row.get("estado") or "Pendiente")
+                new_state = c1.selectbox("Nuevo estado", OT_STATES,
+                    index=OT_STATES.index(old_state) if old_state in OT_STATES else 0,
+                    key="pulso_ot_state")
+                next_step = c2.text_input("Próximo paso", str(row.get("proximo_paso") or ""), key="pulso_ot_next")
+                if st.button("Guardar seguimiento", type="primary", use_container_width=True):
+                    update_work_order(row["id"], {"estado":new_state, "proximo_paso":next_step.strip() or None})
+                    st.success("OT actualizada.")
+                    st.rerun()
+
+    with tab2:
+        a,b = st.columns(2)
+        number = a.text_input("Nº OT", f"OT-{date.today().strftime('%Y%m%d')}", key="pulso_new_no")
+        client = b.text_input("Cliente *", key="pulso_new_client")
+        c,d = st.columns(2)
+        plant = c.text_input("Planta / sucursal", key="pulso_new_plant")
+        service = d.selectbox("Servicio", PULSO_SERVICES, key="pulso_new_service")
+        e,f,g = st.columns(3)
+        planned = e.date_input("Fecha programada", date.today(), key="pulso_new_date")
+        owner = f.text_input("Responsable", "Andrés", key="pulso_new_owner")
+        state = g.selectbox("Estado", OT_STATES[:5], key="pulso_new_state")
+        h,i = st.columns(2)
+        sale = h.number_input("Precio vendido Gs.", min_value=0.0, step=100000.0, key="pulso_new_sale")
+        estimated = i.number_input("Costo estimado Gs.", min_value=0.0, step=100000.0, key="pulso_new_est")
+        scope = st.text_area("Alcance del trabajo", key="pulso_new_scope")
+        if st.button("Crear orden de trabajo", type="primary", use_container_width=True):
+            if not client.strip():
+                st.warning("Ingresá el cliente.")
+            else:
+                try:
+                    save_work_order({
+                        "numero_ot":number.strip(),"cliente":client.strip(),
+                        "planta":plant.strip() or None,"servicio":service,"estado":state,
+                        "fecha_programada":planned.isoformat(),"responsable":owner.strip() or None,
+                        "precio_venta":sale,"costo_estimado":estimated,
+                        "alcance":scope.strip() or None,"origen":"ERP Pulso AG"
+                    })
+                    st.success("OT creada.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error("Ejecutá primero el SQL V4.0 en Supabase.")
+                    st.caption(str(exc))
+
+    with tab3:
+        if ots.empty:
+            st.info("Primero creá una OT.")
+        else:
+            labels = {f'{r.get("numero_ot","OT")} · {r.get("cliente","")}': r["id"] for _,r in ots.iterrows()}
+            label = st.selectbox("OT", list(labels.keys()), key="pulso_cost_ot")
+            ot_id = labels[label]
+            row = ots[ots["id"].astype(str).eq(str(ot_id))].iloc[0]
+            costs = fetch_ot_costs(ot_id)
+            actual = float(pd.to_numeric(costs.get("monto",pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not costs.empty else 0
+            sale = float(row.get("precio_venta") or 0)
+            c1,c2,c3 = st.columns(3)
+            c1.metric("Venta", pulso_money(sale))
+            c2.metric("Costo real", pulso_money(actual))
+            c3.metric("Margen", pulso_money(sale-actual))
+            x,y,z = st.columns([1,1,2])
+            kind = x.selectbox("Costo", ["Material","Mano de obra","Traslado","Tercerizado","Herramienta","Otro"], key="pulso_cost_kind")
+            amount = y.number_input("Monto Gs.", min_value=0.0, step=50000.0, key="pulso_cost_amount")
+            detail = z.text_input("Detalle", key="pulso_cost_detail")
+            if st.button("Agregar costo", use_container_width=True):
+                supabase.table("ot_costos").insert({"ot_id":ot_id,"tipo":kind,"detalle":detail.strip() or None,"monto":amount}).execute()
+                st.success("Costo agregado.")
+                st.rerun()
+            if not costs.empty:
+                st.dataframe(costs, hide_index=True, use_container_width=True)
+
+
+# ============================================================
+# SERVICIOS - PULSO AG
+# ============================================================
+elif page == "⚙️ Servicios":
+    page_header("Servicios Pulso AG", "Catálogo técnico-comercial")
+    services = fetch_pulso_services()
+    if services.empty:
+        st.info("Ejecutá el SQL V4.0 para cargar el catálogo inicial.")
+        for item in PULSO_SERVICES:
+            st.write("• " + item)
+    else:
+        cols = [c for c in ["nombre","familia","descripcion","activo"] if c in services.columns]
+        st.dataframe(services[cols], hide_index=True, use_container_width=True)
+
+
+elif page == "📋 Proyectos":
+    page_header("Proyectos", "Seguimiento de tareas, responsables, fechas y avance")
+
+    projects_df = fetch_projects()
+    tasks_df = fetch_project_tasks()
+
+    if projects_df.empty:
+        st.info("Todavía no hay proyectos. Importá **3 - Cronograma Andres gonzalez.xlsx** desde Importar Excel.")
+    else:
+        active = int(projects_df.get("estado", pd.Series(dtype=str)).astype(str).str.lower().eq("activo").sum())
+        completed_tasks = int(tasks_df.get("estado", pd.Series(dtype=str)).astype(str).str.lower().eq("completado").sum()) if not tasks_df.empty else 0
+        total_tasks = len(tasks_df)
+        overdue = len(project_due_rows())
+
+        k1,k2,k3,k4 = st.columns(4)
+        k1.metric("Proyectos", len(projects_df))
+        k2.metric("Activos", active)
+        k3.metric("Tareas completadas", f"{completed_tasks}/{total_tasks}")
+        k4.metric("Vencidas / vencen hoy", overdue)
+
+        project_map = {str(r["nombre"]): r["id"] for _,r in projects_df.iterrows()}
+        selected_name = st.selectbox("Proyecto", list(project_map.keys()))
+        selected_id = project_map[selected_name]
+        p_tasks = fetch_project_tasks(selected_id)
+
+        if p_tasks.empty:
+            st.info("Este proyecto todavía no tiene tareas.")
+        else:
+            p = p_tasks.copy()
+            p["Progreso %"] = (pd.to_numeric(p["progreso"], errors="coerce").fillna(0)*100).round(0)
+            cols = [c for c in ["tarea","asignado_a","Progreso %","fecha_inicio","fecha_fin","estado"] if c in p.columns]
+            st.dataframe(p[cols].rename(columns={
+                "tarea":"Tarea","asignado_a":"Responsable","fecha_inicio":"Inicio","fecha_fin":"Fin","estado":"Estado"
+            }), hide_index=True, use_container_width=True)
+
+            st.markdown("### Avance")
+            progress_value = float(pd.to_numeric(p["progreso"], errors="coerce").fillna(0).mean())
+            st.progress(max(0.0, min(progress_value, 1.0)))
+            st.caption(f"Avance promedio: {progress_value*100:.0f}%")
+
+        with st.expander("➕ Agregar tarea al proyecto"):
+            task = st.text_input("Tarea", key="proj_task_new")
+            aa,bb,cc = st.columns(3)
+            owner = aa.text_input("Responsable", "Andrés", key="proj_owner_new")
+            start_d = bb.date_input("Inicio", date.today(), key="proj_start_new")
+            end_d = cc.date_input("Fin", date.today(), key="proj_end_new")
+            if st.button("Guardar tarea de proyecto", type="primary", use_container_width=True):
+                if not task.strip():
+                    st.warning("Escribí una tarea.")
+                else:
+                    try:
+                        save_project_task({
+                            "proyecto_id": selected_id,
+                            "tarea": task.strip(),
+                            "asignado_a": owner.strip() or "Andrés",
+                            "progreso": 0,
+                            "fecha_inicio": start_d.isoformat(),
+                            "fecha_fin": end_d.isoformat(),
+                            "estado": "Pendiente",
+                            "origen": "ERP",
+                        })
+                        st.success("Tarea agregada.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error("No se pudo guardar. Verificá que el SQL V3.13.0 esté ejecutado.")
+                        st.caption(str(exc))
+
+
 elif page == "🛒 Ventas":
     page_header("Ventas", "Registro de ventas y descuento automático de stock")
     st.info("Módulo preparado en el menú. Se implementará después de cerrar Presupuestos + Stock.")
@@ -4609,7 +5343,7 @@ elif page == "🏷️ Stock":
 # ============================================================
 elif page == "🔎 Compras / OCR":
     page_header("Compras / OCR", "Carga masiva de presupuestos y facturas PDF")
-    st.success("V3.12.1: corrige el motor OCR para RapidOCR actual y el nombre COMPRA-MMDD-NÚMERO-PROVEEDOR ahora fija correctamente fecha, número y proveedor.")
+    st.success("V4.0.0: Pulso AG integra Comercial, Presupuestos, Órdenes de Trabajo, Proyectos, Agenda, Servicios, Compras, Materiales, Stock, Finanzas y Reportes.")
 
     tab_import, tab_history = st.tabs(["📄 Importar PDF", "🗂️ Documentos importados"])
 
@@ -5514,7 +6248,7 @@ elif page == "🏭 Proveedores / Materiales":
 # ============================================================
 # CAJA
 # ============================================================
-elif page == "💵 Caja":
+elif page == "💵 Finanzas / Caja":
     page_header("Caja", "Apertura, movimientos y cierre")
 
     c1, c2, c3 = st.columns(3)
@@ -5662,6 +6396,65 @@ elif page == "⬆️ Importar Excel":
         except Exception as exc:
             st.error(f"No se pudo preparar la migración: {exc}")
 
+
+    st.markdown("---")
+    st.markdown("### 📅 Agenda, Presupuestos históricos y Proyectos")
+    st.caption("Estos importadores están preparados para los tres Excel que venías usando.")
+
+    daily_file = st.file_uploader("1- DIARIO.xlsx", type=["xlsx"], key="daily_upload_v313")
+    if daily_file:
+        try:
+            daily_df = parse_daily_excel(daily_file)
+            st.metric("Bloques de rutina detectados", len(daily_df))
+            st.dataframe(daily_df.head(80), hide_index=True, use_container_width=True)
+            if st.button("🚀 Migrar rutina a Agenda", type="primary", use_container_width=True, key="migrate_daily_v313"):
+                try:
+                    n = migrate_daily_to_db(daily_df)
+                    st.success(f"Rutina migrada. {n} actividad(es) nueva(s) agregada(s).")
+                except Exception as exc:
+                    st.error("No se pudo migrar. Ejecutá primero supabase_v3_13_0.sql.")
+                    st.caption(str(exc))
+        except Exception as exc:
+            st.error(f"No se pudo leer el Diario: {exc}")
+
+    budget_file = st.file_uploader("2 - PRESUPUESTO ABIERTOS CERRADO PENDIENTES.xlsx", type=["xlsx"], key="budget_track_upload_v313")
+    if budget_file:
+        try:
+            budget_df = parse_budget_tracking_excel(budget_file)
+            b1,b2,b3 = st.columns(3)
+            b1.metric("Registros", len(budget_df))
+            b2.metric("Cotizado", pyg(budget_df.loc[budget_df["estado"].eq("Cotizado"),"monto"].sum()))
+            b3.metric("Aprobado", pyg(budget_df.loc[budget_df["estado"].eq("Aprobado"),"monto"].sum()))
+            st.dataframe(budget_df, hide_index=True, use_container_width=True)
+            if st.button("🚀 Migrar seguimiento de presupuestos", type="primary", use_container_width=True, key="migrate_budget_track_v313"):
+                try:
+                    n = migrate_budget_tracking_to_db(budget_df)
+                    st.success(f"Seguimiento migrado. {n} registro(s) nuevo(s).")
+                except Exception as exc:
+                    st.error("No se pudo migrar. Ejecutá primero supabase_v3_13_0.sql.")
+                    st.caption(str(exc))
+        except Exception as exc:
+            st.error(f"No se pudo leer el Excel de presupuestos: {exc}")
+
+    project_file = st.file_uploader("3 - Cronograma Andres gonzalez.xlsx", type=["xlsx"], key="projects_upload_v313")
+    if project_file:
+        try:
+            project_names, project_tasks = parse_project_schedule_excel(project_file)
+            p1,p2 = st.columns(2)
+            p1.metric("Proyectos detectados", len(project_names))
+            p2.metric("Tareas detectadas", len(project_tasks))
+            st.dataframe(project_tasks.head(100), hide_index=True, use_container_width=True)
+            if st.button("🚀 Migrar Proyectos", type="primary", use_container_width=True, key="migrate_projects_v313"):
+                try:
+                    np, nt = migrate_projects_to_db(project_names, project_tasks)
+                    st.success(f"Migración lista. Proyectos nuevos: {np} · Tareas nuevas: {nt}.")
+                except Exception as exc:
+                    st.error("No se pudo migrar. Ejecutá primero supabase_v3_13_0.sql.")
+                    st.caption(str(exc))
+        except Exception as exc:
+            st.error(f"No se pudo leer el Cronograma: {exc}")
+
+
     st.markdown("---")
     flow_file = st.file_uploader("FLUJO RI SRL.xlsx (finanzas)", type=["xlsx"], key="flow_upload_v33")
     if flow_file:
@@ -5673,14 +6466,14 @@ elif page == "⬆️ Importar Excel":
 # ============================================================
 elif page == "⚙️ Configuración":
     page_header("Configuración", "Parámetros generales del sistema")
-    st.text_input("Empresa", "Respaldo Industrial SRL")
+    st.text_input("Empresa", "Pulso AG")
     st.selectbox("Moneda principal", ["PYG - Guaraní", "USD - Dólar"])
     st.selectbox("Formato de fecha", ["DD/MM/YYYY"])
-    st.success("Supabase está configurado para CRM + Clientes.")
+    st.success("Supabase está configurado para CRM, Clientes, Compras, Agenda y Proyectos.")
     st.info("Los próximos módulos en migrarse serán Productos/Stock, Presupuestos, Caja y Compras.")
 
 
 st.markdown(
-    '<div class="footer">© 2026 Respaldo Industrial SRL · ERP V3.12.1 OCR real y nombre corregido</div>',
+    '<div class="footer">© 2026 Pulso AG · ERP V4.0.0 Pulso AG</div>',
     unsafe_allow_html=True,
 )
