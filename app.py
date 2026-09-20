@@ -51,7 +51,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "4.2.0 - Pulso AG | Identidad corporativa"
+APP_VERSION = "4.3.0 - Pulso AG | Dashboard industrial"
 
 
 st.markdown("""
@@ -4557,6 +4557,24 @@ def pulso_logo():
     </div>
     """, unsafe_allow_html=True)
 
+
+st.markdown("""
+<style>
+[data-testid="stSidebar"]{background:linear-gradient(180deg,#061A2D,#07314A)!important;border-right:1px solid #0C3854!important}
+[data-testid="stSidebar"] *{color:#F4FAFF!important}
+[data-testid="stSidebar"] a{color:#66D9F3!important}
+[data-testid="stSidebar"] [role="radiogroup"] label:hover{background:#0B3652!important}
+[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked){background:#075C83!important;border:1px solid #00B8E6!important}
+.pulso-brand .pulso-p,.pulso-brand .pulso-ulso{color:#FFF!important}.pulso-brand .pulso-ag{color:#BFC8D0!important}
+.pulso-brand .pulso-tagline{color:#D9E7F0!important}.pulso-brand .pulso-version{color:#83A8BD!important}
+.p43-hero{min-height:210px;border-radius:18px;overflow:hidden;position:relative;margin:0 0 16px;background:linear-gradient(90deg,rgba(3,21,37,.98),rgba(3,31,52,.91) 45%,rgba(3,28,48,.60)),radial-gradient(circle at 75% 45%,rgba(0,184,230,.38),transparent 28%),linear-gradient(135deg,#061A2D,#0C4D68);box-shadow:0 10px 30px rgba(2,28,48,.13)}
+.p43-hero:after{content:"";position:absolute;right:6%;bottom:0;width:47%;height:73%;background:linear-gradient(90deg,transparent 0 7%,rgba(0,184,230,.24) 7% 8%,transparent 8% 18%,rgba(255,255,255,.11) 18% 19%,transparent 19% 31%,rgba(0,184,230,.19) 31% 32%,transparent 32%);clip-path:polygon(0 100%,5% 48%,10% 48%,13% 15%,17% 15%,19% 70%,26% 70%,29% 35%,34% 35%,36% 7%,40% 7%,43% 68%,52% 68%,55% 43%,60% 43%,62% 20%,66% 20%,68% 74%,78% 74%,82% 51%,87% 51%,90% 25%,94% 25%,100% 100%)}
+.p43-hero-inner{position:relative;z-index:2;padding:27px 31px;color:#fff;display:flex;justify-content:space-between}.p43-big{font-size:39px;font-weight:800;letter-spacing:-1.5px}.p43-big b{color:#00B8E6}.p43-sub{font-size:17px;letter-spacing:1px;color:#E6F4FA}.p43-claim{font-size:11px;letter-spacing:4px;line-height:1.8;margin-top:25px;color:#D6E8F0}.p43-right{text-align:right;font-size:13px;letter-spacing:3px;line-height:1.65;margin-top:22px}.p43-line{width:58px;height:3px;background:#00B8E6;margin-top:11px;margin-left:auto}
+.p43-solutions{display:grid;grid-template-columns:repeat(6,1fr);gap:9px;margin:12px 0 17px}.p43-sol{min-height:145px;border-radius:14px;padding:15px 13px;display:flex;flex-direction:column;justify-content:flex-end;color:#fff;box-shadow:0 5px 16px rgba(3,31,52,.11);position:relative;overflow:hidden;background:linear-gradient(155deg,#173B52,#071B2C 72%)}.p43-sol:before{content:"";position:absolute;inset:0;background:radial-gradient(circle at 70% 20%,rgba(0,184,230,.30),transparent 29%),repeating-linear-gradient(90deg,rgba(255,255,255,.045) 0 1px,transparent 1px 23px)}.p43-sol>*{position:relative;z-index:1}.p43-ico{font-size:26px;color:#51D7F3;margin-bottom:8px}.p43-name{font-size:13px;font-weight:800}.p43-desc{font-size:10px;color:#D7E6EE;margin-top:6px;line-height:1.35}.p43-op{font-size:10px;color:#73DDF5;margin-top:7px;font-weight:600}
+@media(max-width:1100px){.p43-solutions{grid-template-columns:repeat(3,1fr)}.p43-right{display:none}}
+</style>
+""", unsafe_allow_html=True)
+
 # ============================================================
 # SIDEBAR
 # ============================================================
@@ -4601,22 +4619,18 @@ with st.sidebar:
 # ============================================================
 if page == "🏠 Inicio":
     st.markdown("""
-    <div class="pulso-hero">
-      <div>
-        <div class="pulso-hero-title">PULSO <b>AG</b></div>
-        <div class="pulso-hero-sub">Tecnología para el Control de Procesos</div>
-      </div>
-      <div class="pulso-hero-claim">SOLUCIONES<br>QUE IMPULSAN<br>TU PRODUCCIÓN</div>
+    <div class="p43-hero"><div class="p43-hero-inner">
+      <div><div class="p43-big">PULSO <b>AG</b></div><div class="p43-sub">Tecnología para el Control de Procesos</div><div class="p43-claim">SOLUCIONES QUE IMPULSAN TU PRODUCCIÓN</div></div>
+      <div class="p43-right">AUTOMATIZACIÓN<br>MONITOREO<br>REGISTRO<br>CONTROL<br>EFICIENCIA<br>RESULTADOS<div class="p43-line"></div></div>
+    </div></div>
+    <div class="p43-solutions">
+      <div class="p43-sol"><div class="p43-ico">⚙</div><div class="p43-name">AUTOMATIZACIÓN</div><div class="p43-desc">PLC, HMI, SCADA, variadores e instrumentación.</div><div class="p43-op">Integrar y controlar procesos →</div></div>
+      <div class="p43-sol"><div class="p43-ico">▥</div><div class="p43-name">MONITOREO</div><div class="p43-desc">Variables, alarmas y datos en tiempo real.</div><div class="p43-op">Decidir con información →</div></div>
+      <div class="p43-sol"><div class="p43-ico">▤</div><div class="p43-name">REGISTRO</div><div class="p43-desc">Históricos de energía, producción y proceso.</div><div class="p43-op">Trazabilidad de operaciones →</div></div>
+      <div class="p43-sol"><div class="p43-ico">⌘</div><div class="p43-name">CONTROL</div><div class="p43-desc">Procesos estables, seguros y repetibles.</div><div class="p43-op">Mejorar la operación →</div></div>
+      <div class="p43-sol"><div class="p43-ico">◒</div><div class="p43-name">EFICIENCIA</div><div class="p43-desc">Energía, aire, mantenimiento y recursos.</div><div class="p43-op">Reducir pérdidas →</div></div>
+      <div class="p43-sol"><div class="p43-ico">↗</div><div class="p43-name">RESULTADOS</div><div class="p43-desc">Disponibilidad, ahorro y mayor productividad.</div><div class="p43-op">Generar más valor →</div></div>
     </div>
-    <div class="pulso-pillars">
-      <div class="pulso-pillar"><div class="pulso-pillar-icon">⚙</div><div class="pulso-pillar-name">Automatización</div></div>
-      <div class="pulso-pillar"><div class="pulso-pillar-icon">▥</div><div class="pulso-pillar-name">Monitoreo</div></div>
-      <div class="pulso-pillar"><div class="pulso-pillar-icon">▤</div><div class="pulso-pillar-name">Registro</div></div>
-      <div class="pulso-pillar"><div class="pulso-pillar-icon">⌘</div><div class="pulso-pillar-name">Control</div></div>
-      <div class="pulso-pillar"><div class="pulso-pillar-icon">◒</div><div class="pulso-pillar-name">Eficiencia</div></div>
-      <div class="pulso-pillar"><div class="pulso-pillar-icon">↗</div><div class="pulso-pillar-name">Resultados</div></div>
-    </div>
-    <div class="pulso-signal"><div class="pulso-signal-line"></div> Conocemos el pulso de tus procesos</div>
     """, unsafe_allow_html=True)
     st.markdown("""
     <div class="pulso-flow">
@@ -6624,6 +6638,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Pulso AG · ERP V4.2.0 Pulso AG</div>',
+    '<div class="footer">© 2026 Pulso AG · ERP V4.3.0 Pulso AG</div>',
     unsafe_allow_html=True,
 )
