@@ -51,7 +51,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "4.1.0 - Pulso AG | Identidad visual 360"
+APP_VERSION = "4.2.0 - Pulso AG | Identidad corporativa"
 
 
 st.markdown("""
@@ -4431,76 +4431,131 @@ def fetch_pulso_services():
 
 
 # ============================================================
-# PULSO AG V4.1 - IDENTIDAD VISUAL
+# PULSO AG V4.2 - IDENTIDAD CORPORATIVA
+# Referencia: manual visual Pulso AG
 # ============================================================
-PULSO_NAVY = "#061E3A"
-PULSO_BLUE = "#0878D8"
-PULSO_CYAN = "#32D7E7"
-PULSO_TEAL = "#39D6C3"
+PULSO_CYAN = "#00B8E6"
+PULSO_DARK = "#4D4D4D"
+PULSO_MID = "#9E9E9E"
+PULSO_LIGHT = "#E6E6E6"
 
 st.markdown("""
 <style>
-/* Pulso AG visual system */
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&display=swap');
+
+html, body, [class*="css"], .stApp, [data-testid="stAppViewContainer"] {
+    font-family:'Montserrat',sans-serif;
+}
+.stApp { background:#FFFFFF; color:#333333; }
+
+/* Sidebar claro, como la papelería corporativa */
 [data-testid="stSidebar"] {
-    background: linear-gradient(180deg,#061E3A 0%,#082A4C 58%,#073B5A 100%);
+    background:linear-gradient(180deg,#FFFFFF 0%,#F7F8F9 100%);
+    border-right:1px solid #E6E6E6;
 }
-[data-testid="stSidebar"] * { color: #F7FBFF; }
-[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,.12); }
-.pulso-logo-wrap { padding: 10px 8px 16px 8px; }
-.pulso-logo-row { display:flex; align-items:center; gap:11px; }
-.pulso-bolt {
-    font-size:37px; line-height:1;
-    background:linear-gradient(180deg,#35E7DF,#3FA9FF);
-    -webkit-background-clip:text; -webkit-text-fill-color:transparent;
-    filter:drop-shadow(0 0 7px rgba(50,215,231,.25));
+[data-testid="stSidebar"] * { color:#4D4D4D; }
+[data-testid="stSidebar"] hr { border-color:#E6E6E6; }
+[data-testid="stSidebar"] [role="radiogroup"] label {
+    border-radius:9px; padding:5px 7px; margin:1px 0;
 }
-.pulso-wordmark { font-size:26px; font-weight:850; letter-spacing:.5px; color:#fff; }
-.pulso-wordmark span { color:#35D7E7; }
-.pulso-tag { font-size:10px; letter-spacing:1.65px; color:#C8D9E9; margin-left:47px; margin-top:-2px; }
-.pulso-motto { font-size:9px; letter-spacing:1.2px; color:#7FB4D5; margin-left:47px; margin-top:6px; }
-div[data-testid="stMetric"] {
-    background:white; border:1px solid #E4EDF5; padding:15px 17px;
-    border-radius:16px; box-shadow:0 5px 18px rgba(5,38,73,.045);
+[data-testid="stSidebar"] [role="radiogroup"] label:hover {
+    background:#F0FAFD;
 }
-div[data-testid="stMetricLabel"] { color:#41617E; }
-div[data-testid="stMetricValue"] { color:#082A4C; }
+[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {
+    background:#EAF9FD;
+}
+
+/* Wordmark inspirado en el manual: oscuro + pulso cian + AG gris */
+.pulso-brand { padding:10px 8px 16px 8px; }
+.pulso-logo-line { display:flex; align-items:center; gap:7px; white-space:nowrap; }
+.pulso-p { font-size:28px; font-weight:800; color:#34383D; letter-spacing:-2px; }
+.pulso-wave {
+    font-size:32px; font-weight:800; color:#00B8E6;
+    letter-spacing:-6px; margin:0 -2px 0 -5px; transform:translateY(-1px);
+}
+.pulso-ulso { font-size:28px; font-weight:800; color:#34383D; letter-spacing:-2px; }
+.pulso-ag { font-size:28px; font-weight:700; color:#9E9E9E; letter-spacing:-2px; margin-left:4px; }
+.pulso-tagline { font-size:9px; letter-spacing:1.25px; color:#4D4D4D; margin-top:2px; }
+.pulso-version { font-size:9px; color:#9E9E9E; margin-top:7px; }
+
+/* Cabecera */
+.pulso-hero {
+    display:flex; justify-content:space-between; align-items:center;
+    background:#FFFFFF; border-bottom:1px solid #E6E6E6;
+    padding:8px 2px 18px 2px; margin-bottom:8px;
+}
+.pulso-hero-title { font-size:30px; font-weight:800; color:#3E4246; letter-spacing:-1px; }
+.pulso-hero-title b { color:#00B8E6; }
+.pulso-hero-sub { font-size:15px; color:#555; margin-top:2px; }
+.pulso-hero-claim {
+    text-align:right; font-size:13px; letter-spacing:4px; line-height:1.75;
+    color:#34383D; text-transform:uppercase;
+}
+.pulso-hero-claim:after {
+    content:""; display:block; width:58px; height:3px; background:#00B8E6;
+    margin-top:8px; margin-left:auto;
+}
+
+/* Seis pilares del manual */
+.pulso-pillars {
+    display:grid; grid-template-columns:repeat(6,1fr); gap:10px;
+    margin:13px 0 17px 0;
+}
+.pulso-pillar {
+    text-align:center; border:1px solid #ECEFF1; border-radius:14px;
+    padding:13px 5px 10px; background:#FFF; min-height:76px;
+}
+.pulso-pillar-icon { font-size:21px; color:#34383D; }
+.pulso-pillar-name { font-size:10px; font-weight:600; color:#34383D; margin-top:5px; text-transform:uppercase; }
+
+/* Flujo */
 .pulso-flow {
-    background:linear-gradient(90deg,#EDF6FF,#F2FBFF);
-    border:1px solid #DFEDF8; border-radius:14px; padding:14px 18px;
-    color:#0B4F91; font-weight:650; margin:8px 0 16px 0;
+    background:#F7FBFC; border-left:4px solid #00B8E6;
+    border-top:1px solid #E6F2F5; border-right:1px solid #E6F2F5;
+    border-bottom:1px solid #E6F2F5; border-radius:9px;
+    padding:13px 16px; color:#4D4D4D; font-weight:600; margin:7px 0 17px 0;
 }
-.pulso-service-strip {
-    display:flex; gap:24px; flex-wrap:wrap; color:#173B5D;
-    padding:8px 2px 14px 2px; font-weight:600; font-size:14px;
+
+/* Métricas y contenedores */
+div[data-testid="stMetric"] {
+    background:#FFFFFF; border:1px solid #E6E6E6; padding:15px 17px;
+    border-radius:12px; box-shadow:0 2px 9px rgba(0,0,0,.035);
 }
-.pulso-banner {
-    background:linear-gradient(105deg,#F6FBFF 0%,#E9F5FF 55%,#E2F7F6 100%);
-    border:1px solid #E1EDF6; border-radius:18px; padding:19px 22px;
-    margin:0 0 14px 0; position:relative; overflow:hidden;
+div[data-testid="stMetricLabel"] { color:#777; text-transform:uppercase; letter-spacing:.7px; }
+div[data-testid="stMetricValue"] { color:#34383D; }
+div[data-testid="stMetricDelta"] { color:#00A8D4; }
+.stButton > button[kind="primary"] {
+    background:#00B8E6; border-color:#00B8E6; color:white; border-radius:8px;
 }
-.pulso-banner:after {
-    content:""; position:absolute; right:-45px; top:-75px; width:260px; height:210px;
-    background:linear-gradient(135deg,rgba(8,120,216,.10),rgba(50,215,231,.18));
-    transform:skewX(-24deg);
+.stButton > button:not([kind="primary"]) {
+    border-color:#DADFE3; color:#4D4D4D; border-radius:8px;
 }
-.pulso-title { font-size:35px; font-weight:850; color:#082A4C; line-height:1.1; }
-.pulso-sub { color:#58728A; font-size:17px; margin-top:6px; }
-.pulso-right { float:right; text-align:right; color:#123C60; font-weight:700; position:relative; z-index:2; }
+h1,h2,h3 { color:#34383D; letter-spacing:-.35px; }
+a { color:#00A9D6 !important; }
+
+/* Barra decorativa de pulso */
+.pulso-signal {
+    display:flex; align-items:center; gap:10px; margin:4px 0 13px;
+    color:#9E9E9E; font-size:11px; letter-spacing:2px; text-transform:uppercase;
+}
+.pulso-signal-line { height:2px; width:75px; background:#00B8E6; }
+@media (max-width: 900px) {
+    .pulso-pillars { grid-template-columns:repeat(3,1fr); }
+    .pulso-hero-claim { display:none; }
+}
 </style>
 """, unsafe_allow_html=True)
 
 def pulso_logo():
-    st.markdown("""
-    <div class="pulso-logo-wrap">
-      <div class="pulso-logo-row">
-        <div class="pulso-bolt">ϟ</div>
-        <div class="pulso-wordmark">PULSO <span>AG</span></div>
+    st.markdown(f"""
+    <div class="pulso-brand">
+      <div class="pulso-logo-line">
+        <span class="pulso-p">P</span><span class="pulso-wave">〰∧〰</span><span class="pulso-ulso">LSO</span><span class="pulso-ag">AG</span>
       </div>
-      <div class="pulso-tag">SOLUCIONES INDUSTRIALES 360</div>
-      <div class="pulso-motto">MEDIMOS · CONTROLAMOS · IMPULSAMOS</div>
+      <div class="pulso-tagline">Tecnología para el Control de Procesos</div>
+      <div class="pulso-version">{APP_VERSION}</div>
     </div>
     """, unsafe_allow_html=True)
-
 
 # ============================================================
 # SIDEBAR
@@ -4545,18 +4600,23 @@ with st.sidebar:
 # DASHBOARD
 # ============================================================
 if page == "🏠 Inicio":
-    st.markdown(f"""
-    <div class="pulso-banner">
-      <div class="pulso-right">INDUSTRIA<br>EN MOVIMIENTO</div>
-      <div class="pulso-title">Pulso AG</div>
-      <div class="pulso-sub">Centro de control comercial, técnico y financiero</div>
-    </div>
-    """, unsafe_allow_html=True)
     st.markdown("""
-    <div class="pulso-service-strip">
-      <span>〽 Automatización</span><span>⚙ Energía</span><span>🛡 Mantenimiento</span>
-      <span>♻ Sostenibilidad</span><span>▥ Resultados</span>
+    <div class="pulso-hero">
+      <div>
+        <div class="pulso-hero-title">PULSO <b>AG</b></div>
+        <div class="pulso-hero-sub">Tecnología para el Control de Procesos</div>
+      </div>
+      <div class="pulso-hero-claim">SOLUCIONES<br>QUE IMPULSAN<br>TU PRODUCCIÓN</div>
     </div>
+    <div class="pulso-pillars">
+      <div class="pulso-pillar"><div class="pulso-pillar-icon">⚙</div><div class="pulso-pillar-name">Automatización</div></div>
+      <div class="pulso-pillar"><div class="pulso-pillar-icon">▥</div><div class="pulso-pillar-name">Monitoreo</div></div>
+      <div class="pulso-pillar"><div class="pulso-pillar-icon">▤</div><div class="pulso-pillar-name">Registro</div></div>
+      <div class="pulso-pillar"><div class="pulso-pillar-icon">⌘</div><div class="pulso-pillar-name">Control</div></div>
+      <div class="pulso-pillar"><div class="pulso-pillar-icon">◒</div><div class="pulso-pillar-name">Eficiencia</div></div>
+      <div class="pulso-pillar"><div class="pulso-pillar-icon">↗</div><div class="pulso-pillar-name">Resultados</div></div>
+    </div>
+    <div class="pulso-signal"><div class="pulso-signal-line"></div> Conocemos el pulso de tus procesos</div>
     """, unsafe_allow_html=True)
     st.markdown("""
     <div class="pulso-flow">
@@ -6564,6 +6624,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Pulso AG · ERP V4.1.0 Pulso AG</div>',
+    '<div class="footer">© 2026 Pulso AG · ERP V4.2.0 Pulso AG</div>',
     unsafe_allow_html=True,
 )
