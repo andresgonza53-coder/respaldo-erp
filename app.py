@@ -51,7 +51,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "4.0.0 - Pulso AG | Gestión industrial 360"
+APP_VERSION = "4.1.0 - Pulso AG | Identidad visual 360"
 
 
 st.markdown("""
@@ -4429,12 +4429,84 @@ def fetch_pulso_services():
     return pd.DataFrame(_safe_table("servicios_pulso", "*", "nombre", False))
 
 
+
+# ============================================================
+# PULSO AG V4.1 - IDENTIDAD VISUAL
+# ============================================================
+PULSO_NAVY = "#061E3A"
+PULSO_BLUE = "#0878D8"
+PULSO_CYAN = "#32D7E7"
+PULSO_TEAL = "#39D6C3"
+
+st.markdown("""
+<style>
+/* Pulso AG visual system */
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg,#061E3A 0%,#082A4C 58%,#073B5A 100%);
+}
+[data-testid="stSidebar"] * { color: #F7FBFF; }
+[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,.12); }
+.pulso-logo-wrap { padding: 10px 8px 16px 8px; }
+.pulso-logo-row { display:flex; align-items:center; gap:11px; }
+.pulso-bolt {
+    font-size:37px; line-height:1;
+    background:linear-gradient(180deg,#35E7DF,#3FA9FF);
+    -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+    filter:drop-shadow(0 0 7px rgba(50,215,231,.25));
+}
+.pulso-wordmark { font-size:26px; font-weight:850; letter-spacing:.5px; color:#fff; }
+.pulso-wordmark span { color:#35D7E7; }
+.pulso-tag { font-size:10px; letter-spacing:1.65px; color:#C8D9E9; margin-left:47px; margin-top:-2px; }
+.pulso-motto { font-size:9px; letter-spacing:1.2px; color:#7FB4D5; margin-left:47px; margin-top:6px; }
+div[data-testid="stMetric"] {
+    background:white; border:1px solid #E4EDF5; padding:15px 17px;
+    border-radius:16px; box-shadow:0 5px 18px rgba(5,38,73,.045);
+}
+div[data-testid="stMetricLabel"] { color:#41617E; }
+div[data-testid="stMetricValue"] { color:#082A4C; }
+.pulso-flow {
+    background:linear-gradient(90deg,#EDF6FF,#F2FBFF);
+    border:1px solid #DFEDF8; border-radius:14px; padding:14px 18px;
+    color:#0B4F91; font-weight:650; margin:8px 0 16px 0;
+}
+.pulso-service-strip {
+    display:flex; gap:24px; flex-wrap:wrap; color:#173B5D;
+    padding:8px 2px 14px 2px; font-weight:600; font-size:14px;
+}
+.pulso-banner {
+    background:linear-gradient(105deg,#F6FBFF 0%,#E9F5FF 55%,#E2F7F6 100%);
+    border:1px solid #E1EDF6; border-radius:18px; padding:19px 22px;
+    margin:0 0 14px 0; position:relative; overflow:hidden;
+}
+.pulso-banner:after {
+    content:""; position:absolute; right:-45px; top:-75px; width:260px; height:210px;
+    background:linear-gradient(135deg,rgba(8,120,216,.10),rgba(50,215,231,.18));
+    transform:skewX(-24deg);
+}
+.pulso-title { font-size:35px; font-weight:850; color:#082A4C; line-height:1.1; }
+.pulso-sub { color:#58728A; font-size:17px; margin-top:6px; }
+.pulso-right { float:right; text-align:right; color:#123C60; font-weight:700; position:relative; z-index:2; }
+</style>
+""", unsafe_allow_html=True)
+
+def pulso_logo():
+    st.markdown("""
+    <div class="pulso-logo-wrap">
+      <div class="pulso-logo-row">
+        <div class="pulso-bolt">ϟ</div>
+        <div class="pulso-wordmark">PULSO <span>AG</span></div>
+      </div>
+      <div class="pulso-tag">SOLUCIONES INDUSTRIALES 360</div>
+      <div class="pulso-motto">MEDIMOS · CONTROLAMOS · IMPULSAMOS</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
 # ============================================================
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown('<div class="brand">⚡ PULSO AG</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="brand-sub">{APP_VERSION}</div>', unsafe_allow_html=True)
+    pulso_logo()
 
     page = st.radio(
         "Navegación",
@@ -4473,8 +4545,26 @@ with st.sidebar:
 # DASHBOARD
 # ============================================================
 if page == "🏠 Inicio":
-    page_header("Pulso AG", "Centro de control comercial, técnico y financiero")
-    st.info("Prospecto → Relevamiento → Presupuesto → Aprobación → OT / Proyecto → Compras → Ejecución → Informe → Facturación → Cobro → Posventa")
+    st.markdown(f"""
+    <div class="pulso-banner">
+      <div class="pulso-right">INDUSTRIA<br>EN MOVIMIENTO</div>
+      <div class="pulso-title">Pulso AG</div>
+      <div class="pulso-sub">Centro de control comercial, técnico y financiero</div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown("""
+    <div class="pulso-service-strip">
+      <span>〽 Automatización</span><span>⚙ Energía</span><span>🛡 Mantenimiento</span>
+      <span>♻ Sostenibilidad</span><span>▥ Resultados</span>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown("""
+    <div class="pulso-flow">
+    Prospecto &nbsp;→&nbsp; Relevamiento &nbsp;→&nbsp; Presupuesto &nbsp;→&nbsp; Aprobación
+    &nbsp;→&nbsp; OT / Proyecto &nbsp;→&nbsp; Compras &nbsp;→&nbsp; Ejecución
+    &nbsp;→&nbsp; Informe &nbsp;→&nbsp; Facturación &nbsp;→&nbsp; Cobro &nbsp;→&nbsp; Posventa
+    </div>
+    """, unsafe_allow_html=True)
 
     imported_crm = st.session_state.imported_stats
     crm_total = imported_crm.get("clientes") if imported_crm else None
@@ -6474,6 +6564,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Pulso AG · ERP V4.0.0 Pulso AG</div>',
+    '<div class="footer">© 2026 Pulso AG · ERP V4.1.0 Pulso AG</div>',
     unsafe_allow_html=True,
 )
