@@ -51,7 +51,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "4.3.1 - Pulso AG | Identidad corporativa"
+APP_VERSION = "4.3.2 - Pulso AG | Gestión de clientes"
 
 
 st.markdown("""
@@ -4913,19 +4913,190 @@ elif page == "🤝 Comercial / CRM":
 # ============================================================
 elif page == "👥 Clientes":
     page_header("Clientes", "Base comercial persistente en Supabase")
+
     clients_df, _ = fetch_crm_from_db()
 
-    if clients_df.empty:
-        st.info("Todavía no hay clientes guardados. Usá **Importar Excel** para migrar la base inicial.")
-    else:
-        search = st.text_input("Buscar", placeholder="Cliente, RUC, teléfono, correo...")
-        view = clients_df.copy()
-        if search:
-            mask = pd.Series(False, index=view.index)
-            for col in view.columns:
-                mask = mask | view[col].astype(str).str.contains(search, case=False, na=False)
-            view = view[mask]
-        st.dataframe(view.drop(columns=["id"], errors="ignore"), hide_index=True, use_container_width=True)
+    tab_list, tab_new, tab_edit = st.tabs([
+        "📋 Lista de clientes", "➕ Nuevo cliente", "✏️ Editar cliente"
+    ])
+
+    with tab_list:
+        if clients_df.empty:
+            st.info("Todavía no hay clientes guardados. Podés crear el primero desde **Nuevo cliente**.")
+        else:
+            c1, c2, c3 = st.columns([2.2, 1, 1])
+            with c1:
+                search = st.text_input(
+                    "Buscar",
+                    placeholder="Cliente, RUC, ciudad, teléfono, correo...",
+                    key="clients_search_v432"
+                )
+            with c2:
+                state_filter = st.selectbox(
+                    "Estado",
+                    ["Todos", "Activo", "Inactivo"],
+                    key="clients_state_filter_v432"
+                )
+            with c3:
+                st.metric("Clientes", len(clients_df))
+
+            view = clients_df.copy()
+            if search:
+                mask = pd.Series(False, index=view.index)
+                for col in view.columns:
+                    mask = mask | view[col].astype(str).str.contains(
+                        search, case=False, na=False, regex=False
+                    )
+                view = view[mask]
+
+            if state_filter != "Todos" and "Estado" in view.columns:
+                view = view[
+                    view["Estado"].fillna("Activo").astype(str).str.casefold()
+                    == state_filter.casefold()
+                ]
+
+            st.caption(f"Mostrando {len(view)} de {len(clients_df)} clientes")
+            st.dataframe(
+                view.drop(columns=["id"], errors="ignore"),
+                hide_index=True,
+                use_container_width=True
+            )
+
+    with tab_new:
+        st.markdown("### Crear cliente")
+        st.caption("El cliente quedará guardado directamente en la base actual. No requiere cambios en SQL.")
+
+        with st.form("new_client_form_v432", clear_on_submit=True):
+            a, b = st.columns([2, 1])
+            nombre = a.text_input("Razón social / Nombre *")
+            ruc = b.text_input("RUC")
+
+            c1, c2 = st.columns(2)
+            ciudad = c1.text_input("Ciudad")
+            direccion = c2.text_input("Dirección")
+
+            c3, c4 = st.columns(2)
+            telefono = c3.text_input("Teléfono / WhatsApp")
+            correo = c4.text_input("Correo")
+
+            estado = st.selectbox("Estado", ["Activo", "Inactivo"], index=0)
+            save_new = st.form_submit_button(
+                "💾 Guardar cliente",
+                type="primary",
+                use_container_width=True
+            )
+
+        if save_new:
+            nombre_limpio = (nombre or "").strip()
+            if not nombre_limpio:
+                st.error("La Razón social / Nombre es obligatoria.")
+            else:
+                try:
+                    existing = (
+                        supabase.table("clientes")
+                        .select("id,nombre")
+                        .ilike("nombre", nombre_limpio)
+                        .limit(1)
+                        .execute()
+                    )
+                    if existing.data:
+                        st.warning(
+                            f"Ya existe un cliente con el nombre **{existing.data[0].get('nombre', nombre_limpio)}**. "
+                            "Revisalo antes de crear un duplicado."
+                        )
+                    else:
+                        payload = {
+                            "nombre": nombre_limpio,
+                            "ruc": (ruc or "").strip() or None,
+                            "ciudad": (ciudad or "").strip() or None,
+                            "direccion": (direccion or "").strip() or None,
+                            "telefono": (telefono or "").strip() or None,
+                            "correo": (correo or "").strip() or None,
+                            "estado": estado,
+                            "origen": "Pulso AG ERP",
+                        }
+                        supabase.table("clientes").insert(payload).execute()
+                        st.success(f"Cliente **{nombre_limpio}** creado correctamente.")
+                        st.rerun()
+                except Exception as exc:
+                    st.error("No se pudo crear el cliente.")
+                    st.caption(str(exc))
+
+    with tab_edit:
+        if clients_df.empty:
+            st.info("Todavía no hay clientes para editar.")
+        else:
+            options = clients_df.copy()
+            options["_label"] = options.apply(
+                lambda r: f"{r.get('Cliente','')} · {r.get('RUC','')}"
+                if str(r.get("RUC","") or "").strip()
+                else str(r.get("Cliente","")),
+                axis=1
+            )
+            selected_label = st.selectbox(
+                "Seleccionar cliente",
+                options["_label"].tolist(),
+                key="edit_client_selector_v432"
+            )
+            selected = options[options["_label"].eq(selected_label)].iloc[0]
+
+            def _clean(v):
+                if pd.isna(v):
+                    return ""
+                s = str(v)
+                return "" if s in ("None", "nan", "<NA>") else s
+
+            with st.form("edit_client_form_v432"):
+                a, b = st.columns([2, 1])
+                e_nombre = a.text_input(
+                    "Razón social / Nombre *",
+                    value=_clean(selected.get("Cliente"))
+                )
+                e_ruc = b.text_input("RUC", value=_clean(selected.get("RUC")))
+
+                c1, c2 = st.columns(2)
+                e_ciudad = c1.text_input("Ciudad", value=_clean(selected.get("Ciudad")))
+                e_direccion = c2.text_input("Dirección", value=_clean(selected.get("Dirección")))
+
+                c3, c4 = st.columns(2)
+                e_telefono = c3.text_input("Teléfono / WhatsApp", value=_clean(selected.get("Teléfono")))
+                e_correo = c4.text_input("Correo", value=_clean(selected.get("Correo")))
+
+                current_state = _clean(selected.get("Estado")) or "Activo"
+                state_options = ["Activo", "Inactivo"]
+                state_index = 1 if current_state.casefold() == "inactivo" else 0
+                e_estado = st.selectbox("Estado", state_options, index=state_index)
+
+                update_client = st.form_submit_button(
+                    "💾 Guardar cambios",
+                    type="primary",
+                    use_container_width=True
+                )
+
+            if update_client:
+                e_nombre_limpio = (e_nombre or "").strip()
+                if not e_nombre_limpio:
+                    st.error("La Razón social / Nombre es obligatoria.")
+                else:
+                    try:
+                        payload = {
+                            "nombre": e_nombre_limpio,
+                            "ruc": (e_ruc or "").strip() or None,
+                            "ciudad": (e_ciudad or "").strip() or None,
+                            "direccion": (e_direccion or "").strip() or None,
+                            "telefono": (e_telefono or "").strip() or None,
+                            "correo": (e_correo or "").strip() or None,
+                            "estado": e_estado,
+                        }
+                        supabase.table("clientes").update(payload).eq(
+                            "id", selected["id"]
+                        ).execute()
+                        st.success("Cliente actualizado correctamente.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error("No se pudo actualizar el cliente.")
+                        st.caption(str(exc))
+
 
 # ============================================================
 # PRESUPUESTOS
@@ -6639,6 +6810,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Pulso AG · ERP V4.3.0 Pulso AG</div>',
+    '<div class="footer">© 2026 Pulso AG · ERP V4.3.2 Pulso AG</div>',
     unsafe_allow_html=True,
 )
