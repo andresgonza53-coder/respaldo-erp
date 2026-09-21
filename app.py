@@ -51,7 +51,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "4.3.7 - Pulso AG | Ficha de cliente + múltiples contactos"
+APP_VERSION = "4.3.8 - Pulso AG | Contactos corregidos"
 
 
 st.markdown("""
@@ -4971,12 +4971,24 @@ elif page == "👥 Clientes":
             selected_id=selected.get("id")
             def _clean(v): return clean_display_value(v)
 
-            # Lee estructura y contactos actuales antes del formulario para integrarlos visualmente.
+            # V4.3.8: valida la estructura consultando columnas explícitas.
+            # Esto funciona incluso cuando la tabla contactos todavía está vacía.
+            contact_schema_cols = ["id","cliente_id","nombre","area","cargo","telefono","whatsapp","correo","cumpleanos","principal","observaciones","estado"]
+            contacts_schema_error = ""
             try:
-                contacts_raw=supabase.table("contactos").select("*").limit(1000).execute().data or []
-            except Exception:
-                contacts_raw=[]
-            contacts_df=pd.DataFrame(contacts_raw)
+                contacts_raw = (
+                    supabase.table("contactos")
+                    .select(",".join(contact_schema_cols))
+                    .limit(1000)
+                    .execute()
+                    .data or []
+                )
+                structure_ok = True
+            except Exception as exc:
+                contacts_raw = []
+                structure_ok = False
+                contacts_schema_error = str(exc)
+            contacts_df=pd.DataFrame(contacts_raw, columns=contact_schema_cols if structure_ok else None)
             existing_cols=list(contacts_df.columns)
             def _find_col(candidates):
                 normalized={str(c).lower().strip():c for c in existing_cols}
@@ -5001,18 +5013,19 @@ elif page == "👥 Clientes":
                     company_contacts=contacts_df[contacts_df[client_name_col].fillna("").astype(str).str.casefold()==str(selected.get("Cliente","")).casefold()].copy()
 
             st.markdown("#### Datos de la empresa")
-            a,b=st.columns([2,1]); e_nombre=a.text_input("Razón social / Nombre *",value=_clean(selected.get("Cliente")),key=f"v437_nom_{selected_id}"); e_ruc=b.text_input("RUC",value=_clean(selected.get("RUC")),key=f"v437_ruc_{selected_id}")
-            c1,c2=st.columns(2); e_ciudad=c1.text_input("Ciudad",value=_clean(selected.get("Ciudad")),key=f"v437_ciu_{selected_id}"); e_direccion=c2.text_input("Dirección",value=_clean(selected.get("Dirección")),key=f"v437_dir_{selected_id}")
-            c3,c4=st.columns(2); e_telefono=c3.text_input("Teléfono / WhatsApp empresa",value=_clean(selected.get("Teléfono")),key=f"v437_tel_{selected_id}"); e_correo=c4.text_input("Correo empresa",value=_clean(selected.get("Correo")),key=f"v437_mail_{selected_id}")
-            current_state=_clean(selected.get("Estado")) or "Activo"; e_estado=st.selectbox("Estado",["Activo","Inactivo"],index=1 if current_state.casefold()=="inactivo" else 0,key=f"v437_est_{selected_id}")
+            a,b=st.columns([2,1]); e_nombre=a.text_input("Razón social / Nombre *",value=_clean(selected.get("Cliente")),key=f"v438_nom_{selected_id}"); e_ruc=b.text_input("RUC",value=_clean(selected.get("RUC")),key=f"v438_ruc_{selected_id}")
+            c1,c2=st.columns(2); e_ciudad=c1.text_input("Ciudad",value=_clean(selected.get("Ciudad")),key=f"v438_ciu_{selected_id}"); e_direccion=c2.text_input("Dirección",value=_clean(selected.get("Dirección")),key=f"v438_dir_{selected_id}")
+            c3,c4=st.columns(2); e_telefono=c3.text_input("Teléfono / WhatsApp empresa",value=_clean(selected.get("Teléfono")),key=f"v438_tel_{selected_id}"); e_correo=c4.text_input("Correo empresa",value=_clean(selected.get("Correo")),key=f"v438_mail_{selected_id}")
+            current_state=_clean(selected.get("Estado")) or "Activo"; e_estado=st.selectbox("Estado",["Activo","Inactivo"],index=1 if current_state.casefold()=="inactivo" else 0,key=f"v438_est_{selected_id}")
 
             st.markdown("#### 👥 Contactos de esta empresa")
             st.caption("Podés cargar varios contactos en la misma ficha. Agregá o eliminá filas y luego guardá todo con el botón de abajo.")
 
             required_contact_cols = ["cliente_id","nombre","area","cargo","telefono","whatsapp","correo","cumpleanos","principal","observaciones","estado"]
-            structure_ok = all(c in existing_cols for c in ["cliente_id","nombre"])
             if not structure_ok:
-                st.warning("La tabla contactos todavía necesita la actualización SQL V4.3.7. Ejecutá primero el archivo SQL que acompaña esta versión.")
+                st.warning("No se pudo acceder a la estructura completa de la tabla contactos.")
+                if contacts_schema_error:
+                    st.caption(contacts_schema_error)
                 edited_contacts = pd.DataFrame(columns=["Nombre y apellido","Área / Departamento","Cargo / Puesto","Teléfono / Celular","WhatsApp","Correo","Cumpleaños","Principal","Observaciones"])
             else:
                 company_contacts = contacts_df[contacts_df["cliente_id"].astype(str)==str(selected_id)].copy() if not contacts_df.empty else pd.DataFrame()
@@ -5048,16 +5061,16 @@ elif page == "👥 Clientes":
                         "Principal": st.column_config.CheckboxColumn("Principal",default=False),
                         "Observaciones": st.column_config.TextColumn("Observaciones"),
                     },
-                    key=f"contacts_editor_v437_{selected_id}",
+                    key=f"contacts_editor_v438_{selected_id}",
                 )
                 st.caption("Para agregar otro contacto, usá la fila nueva al final de la tabla. Para quitar uno, seleccioná la fila y eliminála desde el editor.")
 
-            save_all=st.button("💾 Guardar ficha del cliente",type="primary",use_container_width=True,key=f"save_ficha_v437_{selected_id}")
+            save_all=st.button("💾 Guardar ficha del cliente",type="primary",use_container_width=True,key=f"save_ficha_v438_{selected_id}")
             if save_all:
                 if not (e_nombre or "").strip():
                     st.error("La Razón social / Nombre es obligatoria.")
                 elif not structure_ok:
-                    st.error("Primero ejecutá el SQL V4.3.7 en Supabase. La empresa no fue modificada.")
+                    st.error("No se pudo acceder a la tabla contactos. La empresa no fue modificada.")
                 else:
                     try:
                         supabase.table("clientes").update({"nombre":e_nombre.strip(),"ruc":(e_ruc or "").strip() or None,"ciudad":(e_ciudad or "").strip() or None,"direccion":(e_direccion or "").strip() or None,"telefono":(e_telefono or "").strip() or None,"correo":(e_correo or "").strip() or None,"estado":e_estado}).eq("id",selected_id).execute()
@@ -6811,6 +6824,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Pulso AG · ERP V4.3.7 Pulso AG</div>',
+    '<div class="footer">© 2026 Pulso AG · ERP V4.3.8 Pulso AG</div>',
     unsafe_allow_html=True,
 )
