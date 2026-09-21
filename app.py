@@ -51,7 +51,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "4.3.4 - Pulso AG | Ficha de cliente + contactos"
+APP_VERSION = "4.3.5 - Pulso AG | Ficha de cliente integrada"
 
 
 st.markdown("""
@@ -4913,12 +4913,9 @@ elif page == "🤝 Comercial / CRM":
 # ============================================================
 elif page == "👥 Clientes":
     page_header("Clientes", "Base comercial persistente en Supabase")
-
     clients_df, _ = fetch_crm_from_db()
 
-    tab_list, tab_new, tab_edit = st.tabs([
-        "📋 Lista de clientes", "➕ Nuevo cliente", "🧾 Ficha del cliente"
-    ])
+    tab_list, tab_new, tab_edit = st.tabs(["📋 Lista de clientes", "➕ Nuevo cliente", "🧾 Ficha del cliente"])
 
     with tab_list:
         if clients_df.empty:
@@ -4926,344 +4923,137 @@ elif page == "👥 Clientes":
         else:
             c1, c2, c3 = st.columns([2.2, 1, 1])
             with c1:
-                search = st.text_input(
-                    "Buscar",
-                    placeholder="Cliente, RUC, ciudad, teléfono, correo...",
-                    key="clients_search_v434"
-                )
+                search = st.text_input("Buscar", placeholder="Cliente, RUC, ciudad, teléfono, correo...", key="clients_search_v435")
             with c2:
-                state_filter = st.selectbox(
-                    "Estado",
-                    ["Todos", "Activo", "Inactivo"],
-                    key="clients_state_filter_v434"
-                )
+                state_filter = st.selectbox("Estado", ["Todos", "Activo", "Inactivo"], key="clients_state_filter_v435")
             with c3:
                 st.metric("Clientes", len(clients_df))
-
             view = clients_df.copy()
             if search:
                 mask = pd.Series(False, index=view.index)
                 for col in view.columns:
-                    mask = mask | view[col].astype(str).str.contains(
-                        search, case=False, na=False, regex=False
-                    )
+                    mask = mask | view[col].astype(str).str.contains(search, case=False, na=False, regex=False)
                 view = view[mask]
-
             if state_filter != "Todos" and "Estado" in view.columns:
-                view = view[
-                    view["Estado"].fillna("Activo").astype(str).str.casefold()
-                    == state_filter.casefold()
-                ]
-
+                view = view[view["Estado"].fillna("Activo").astype(str).str.casefold() == state_filter.casefold()]
             st.caption(f"Mostrando {len(view)} de {len(clients_df)} clientes")
-            st.dataframe(
-                view.drop(columns=["id"], errors="ignore"),
-                hide_index=True,
-                use_container_width=True
-            )
+            st.dataframe(view.drop(columns=["id"], errors="ignore"), hide_index=True, use_container_width=True)
 
     with tab_new:
         st.markdown("### Crear cliente")
-        st.caption("El cliente quedará guardado directamente en la base actual. No requiere cambios en SQL.")
-
-        with st.form("new_client_form_v434", clear_on_submit=True):
-            a, b = st.columns([2, 1])
-            nombre = a.text_input("Razón social / Nombre *")
-            ruc = b.text_input("RUC")
-
-            c1, c2 = st.columns(2)
-            ciudad = c1.text_input("Ciudad")
-            direccion = c2.text_input("Dirección")
-
-            c3, c4 = st.columns(2)
-            telefono = c3.text_input("Teléfono / WhatsApp")
-            correo = c4.text_input("Correo")
-
-            estado = st.selectbox("Estado", ["Activo", "Inactivo"], index=0)
-            save_new = st.form_submit_button(
-                "💾 Guardar cliente",
-                type="primary",
-                use_container_width=True
-            )
-
+        st.caption("Datos generales de la empresa. Los contactos se administran luego desde la Ficha del cliente.")
+        with st.form("new_client_form_v435", clear_on_submit=True):
+            a,b=st.columns([2,1]); nombre=a.text_input("Razón social / Nombre *"); ruc=b.text_input("RUC")
+            c1,c2=st.columns(2); ciudad=c1.text_input("Ciudad"); direccion=c2.text_input("Dirección")
+            c3,c4=st.columns(2); telefono=c3.text_input("Teléfono / WhatsApp"); correo=c4.text_input("Correo")
+            estado=st.selectbox("Estado",["Activo","Inactivo"],index=0)
+            save_new=st.form_submit_button("💾 Guardar cliente",type="primary",use_container_width=True)
         if save_new:
-            nombre_limpio = (nombre or "").strip()
-            if not nombre_limpio:
-                st.error("La Razón social / Nombre es obligatoria.")
+            nombre_limpio=(nombre or "").strip()
+            if not nombre_limpio: st.error("La Razón social / Nombre es obligatoria.")
             else:
                 try:
-                    existing = (
-                        supabase.table("clientes")
-                        .select("id,nombre")
-                        .ilike("nombre", nombre_limpio)
-                        .limit(1)
-                        .execute()
-                    )
-                    if existing.data:
-                        st.warning(
-                            f"Ya existe un cliente con el nombre **{existing.data[0].get('nombre', nombre_limpio)}**. "
-                            "Revisalo antes de crear un duplicado."
-                        )
+                    existing=supabase.table("clientes").select("id,nombre").ilike("nombre",nombre_limpio).limit(1).execute()
+                    if existing.data: st.warning(f"Ya existe un cliente con el nombre **{existing.data[0].get('nombre',nombre_limpio)}**.")
                     else:
-                        payload = {
-                            "nombre": nombre_limpio,
-                            "ruc": (ruc or "").strip() or None,
-                            "ciudad": (ciudad or "").strip() or None,
-                            "direccion": (direccion or "").strip() or None,
-                            "telefono": (telefono or "").strip() or None,
-                            "correo": (correo or "").strip() or None,
-                            "estado": estado,
-                            "origen": "Pulso AG ERP",
-                        }
-                        supabase.table("clientes").insert(payload).execute()
-                        st.success(f"Cliente **{nombre_limpio}** creado correctamente.")
-                        st.rerun()
-                except Exception as exc:
-                    st.error("No se pudo crear el cliente.")
-                    st.caption(str(exc))
+                        supabase.table("clientes").insert({"nombre":nombre_limpio,"ruc":(ruc or "").strip() or None,"ciudad":(ciudad or "").strip() or None,"direccion":(direccion or "").strip() or None,"telefono":(telefono or "").strip() or None,"correo":(correo or "").strip() or None,"estado":estado,"origen":"Pulso AG ERP"}).execute()
+                        st.success(f"Cliente **{nombre_limpio}** creado correctamente."); st.rerun()
+                except Exception as exc: st.error("No se pudo crear el cliente."); st.caption(str(exc))
 
     with tab_edit:
         if clients_df.empty:
             st.info("Todavía no hay clientes para editar.")
         else:
-            options = clients_df.copy()
-            options["_label"] = options.apply(
-                lambda r: f"{r.get('Cliente','')} · {r.get('RUC','')}"
-                if str(r.get("RUC","") or "").strip()
-                else str(r.get("Cliente","")),
-                axis=1
-            )
-            selected_label = st.selectbox(
-                "Seleccionar cliente",
-                options["_label"].tolist(),
-                key="edit_client_selector_v434"
-            )
-            selected = options[options["_label"].eq(selected_label)].iloc[0]
+            options=clients_df.copy()
+            options["_label"]=options.apply(lambda r: f"{r.get('Cliente','')} · {clean_display_value(r.get('RUC'))}" if clean_display_value(r.get('RUC')) else str(r.get('Cliente','')),axis=1)
+            selected_label=st.selectbox("Seleccionar cliente",options["_label"].tolist(),key="edit_client_selector_v435")
+            selected=options[options["_label"].eq(selected_label)].iloc[0]
+            selected_id=selected.get("id")
+            def _clean(v): return clean_display_value(v)
 
-            def _clean(v):
-                if pd.isna(v):
-                    return ""
-                s = str(v)
-                return "" if s in ("None", "nan", "<NA>") else s
+            # Lee estructura y contactos actuales antes del formulario para integrarlos visualmente.
+            try:
+                contacts_raw=supabase.table("contactos").select("*").limit(1000).execute().data or []
+            except Exception:
+                contacts_raw=[]
+            contacts_df=pd.DataFrame(contacts_raw)
+            existing_cols=list(contacts_df.columns)
+            def _find_col(candidates):
+                normalized={str(c).lower().strip():c for c in existing_cols}
+                for candidate in candidates:
+                    if candidate.lower().strip() in normalized: return normalized[candidate.lower().strip()]
+                for c in existing_cols:
+                    nc=str(c).lower()
+                    if any(candidate.lower() in nc for candidate in candidates): return c
+                return None
+            client_id_col=_find_col(["cliente_id","client_id","id_cliente"]); client_name_col=_find_col(["cliente","empresa","razon_social"])
+            name_col=_find_col(["nombre","contacto","nombre_contacto"]); area_col=_find_col(["area","área","departamento","sector"])
+            cargo_col=_find_col(["cargo","puesto"]); phone_col=_find_col(["telefono","teléfono","celular"]); whatsapp_col=_find_col(["whatsapp","wa"])
+            email_col=_find_col(["correo","email","mail"]); birthday_col=_find_col(["cumpleanos","cumpleaños","fecha_nacimiento","nacimiento"])
+            notes_col=_find_col(["observaciones","notas","comentarios"]); principal_col=_find_col(["principal","contacto_principal","es_principal"])
+            state_col=_find_col(["estado","activo"])
 
-            with st.form("edit_client_form_v434"):
-                a, b = st.columns([2, 1])
-                e_nombre = a.text_input(
-                    "Razón social / Nombre *",
-                    value=_clean(selected.get("Cliente"))
-                )
-                e_ruc = b.text_input("RUC", value=_clean(selected.get("RUC")))
+            company_contacts=pd.DataFrame()
+            if not contacts_df.empty:
+                if client_id_col:
+                    company_contacts=contacts_df[contacts_df[client_id_col].astype(str)==str(selected_id)].copy()
+                elif client_name_col:
+                    company_contacts=contacts_df[contacts_df[client_name_col].fillna("").astype(str).str.casefold()==str(selected.get("Cliente","")).casefold()].copy()
 
-                c1, c2 = st.columns(2)
-                e_ciudad = c1.text_input("Ciudad", value=_clean(selected.get("Ciudad")))
-                e_direccion = c2.text_input("Dirección", value=_clean(selected.get("Dirección")))
+            st.markdown("#### Datos de la empresa")
+            with st.form("integrated_client_form_v435"):
+                a,b=st.columns([2,1]); e_nombre=a.text_input("Razón social / Nombre *",value=_clean(selected.get("Cliente"))); e_ruc=b.text_input("RUC",value=_clean(selected.get("RUC")))
+                c1,c2=st.columns(2); e_ciudad=c1.text_input("Ciudad",value=_clean(selected.get("Ciudad"))); e_direccion=c2.text_input("Dirección",value=_clean(selected.get("Dirección")))
+                c3,c4=st.columns(2); e_telefono=c3.text_input("Teléfono / WhatsApp empresa",value=_clean(selected.get("Teléfono"))); e_correo=c4.text_input("Correo empresa",value=_clean(selected.get("Correo")))
+                current_state=_clean(selected.get("Estado")) or "Activo"; e_estado=st.selectbox("Estado",["Activo","Inactivo"],index=1 if current_state.casefold()=="inactivo" else 0)
 
-                c3, c4 = st.columns(2)
-                e_telefono = c3.text_input("Teléfono / WhatsApp", value=_clean(selected.get("Teléfono")))
-                e_correo = c4.text_input("Correo", value=_clean(selected.get("Correo")))
+                st.markdown("#### 👥 Contacto principal / nuevo contacto")
+                st.caption("Completá estos datos si querés agregar una persona de contacto a esta empresa. Si los dejás vacíos, solo se actualiza la empresa.")
+                x1,x2=st.columns(2); contact_name=x1.text_input("Nombre y apellido"); contact_area=x2.text_input("Área / Departamento",placeholder="Compras, Mantenimiento, Producción...")
+                x3,x4=st.columns(2); contact_cargo=x3.text_input("Cargo / Puesto"); contact_phone=x4.text_input("Teléfono / Celular")
+                x5,x6=st.columns(2); contact_wa=x5.text_input("WhatsApp"); contact_email=x6.text_input("Correo del contacto")
+                x7,x8=st.columns(2); contact_birthday=x7.date_input("Cumpleaños",value=None,format="DD/MM/YYYY"); contact_principal=x8.checkbox("Contacto principal",value=True)
+                contact_notes=st.text_area("Observaciones del contacto")
+                save_all=st.form_submit_button("💾 Guardar ficha del cliente",type="primary",use_container_width=True)
 
-                current_state = _clean(selected.get("Estado")) or "Activo"
-                state_options = ["Activo", "Inactivo"]
-                state_index = 1 if current_state.casefold() == "inactivo" else 0
-                e_estado = st.selectbox("Estado", state_options, index=state_index)
-
-                update_client = st.form_submit_button(
-                    "💾 Guardar cambios",
-                    type="primary",
-                    use_container_width=True
-                )
-
-            if update_client:
-                e_nombre_limpio = (e_nombre or "").strip()
-                if not e_nombre_limpio:
-                    st.error("La Razón social / Nombre es obligatoria.")
+            if save_all:
+                if not (e_nombre or "").strip(): st.error("La Razón social / Nombre es obligatoria.")
                 else:
                     try:
-                        payload = {
-                            "nombre": e_nombre_limpio,
-                            "ruc": (e_ruc or "").strip() or None,
-                            "ciudad": (e_ciudad or "").strip() or None,
-                            "direccion": (e_direccion or "").strip() or None,
-                            "telefono": (e_telefono or "").strip() or None,
-                            "correo": (e_correo or "").strip() or None,
-                            "estado": e_estado,
-                        }
-                        supabase.table("clientes").update(payload).eq(
-                            "id", selected["id"]
-                        ).execute()
-                        st.success("Cliente actualizado correctamente.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error("No se pudo actualizar el cliente.")
-                        st.caption(str(exc))
+                        supabase.table("clientes").update({"nombre":e_nombre.strip(),"ruc":(e_ruc or "").strip() or None,"ciudad":(e_ciudad or "").strip() or None,"direccion":(e_direccion or "").strip() or None,"telefono":(e_telefono or "").strip() or None,"correo":(e_correo or "").strip() or None,"estado":e_estado}).eq("id",selected_id).execute()
+                        if (contact_name or "").strip():
+                            if not name_col or (not client_id_col and not client_name_col):
+                                st.warning("La empresa se guardó, pero la estructura actual de contactos no permite guardar el contacto todavía.")
+                            else:
+                                payload={}
+                                if client_id_col: payload[client_id_col]=selected_id
+                                else: payload[client_name_col]=e_nombre.strip()
+                                payload[name_col]=contact_name.strip()
+                                if area_col: payload[area_col]=(contact_area or "").strip() or None
+                                if cargo_col: payload[cargo_col]=(contact_cargo or "").strip() or None
+                                if phone_col: payload[phone_col]=(contact_phone or "").strip() or None
+                                if whatsapp_col: payload[whatsapp_col]=(contact_wa or "").strip() or None
+                                elif phone_col and contact_wa and not contact_phone: payload[phone_col]=contact_wa.strip()
+                                if email_col: payload[email_col]=(contact_email or "").strip() or None
+                                if birthday_col and contact_birthday: payload[birthday_col]=contact_birthday.isoformat()
+                                if principal_col: payload[principal_col]=bool(contact_principal)
+                                if notes_col: payload[notes_col]=(contact_notes or "").strip() or None
+                                if state_col: payload[state_col]="Activo"
+                                supabase.table("contactos").insert(payload).execute()
+                        st.success("Ficha del cliente guardada correctamente."); st.rerun()
+                    except Exception as exc: st.error("No se pudo guardar la ficha completa."); st.caption(str(exc))
 
+            st.markdown("#### Contactos registrados")
+            if company_contacts.empty:
+                st.caption("Todavía no hay contactos registrados para esta empresa.")
+            else:
+                rename={}
+                for col,label in [(name_col,"Contacto"),(area_col,"Área"),(cargo_col,"Cargo"),(phone_col,"Teléfono"),(whatsapp_col,"WhatsApp"),(email_col,"Correo"),(birthday_col,"Cumpleaños"),(principal_col,"Principal"),(notes_col,"Observaciones")]:
+                    if col: rename[col]=label
+                disp=company_contacts.rename(columns=rename)
+                wanted=[c for c in ["Contacto","Área","Cargo","Teléfono","WhatsApp","Correo","Cumpleaños","Principal","Observaciones"] if c in disp.columns]
+                st.dataframe(disp[wanted] if wanted else disp,hide_index=True,use_container_width=True)
 
-
-        st.markdown("---")
-        st.markdown("## 👥 Contactos de esta empresa")
-        st.caption("Los contactos forman parte de la ficha del cliente: compras, mantenimiento, producción, administración y otras áreas.")
-    
-        try:
-            contacts_raw = supabase.table("contactos").select("*").limit(1000).execute().data or []
-            contacts_df = pd.DataFrame(contacts_raw)
-        except Exception as exc:
-            contacts_df = pd.DataFrame()
-            st.error("No se pudo leer la tabla contactos.")
-            st.caption(str(exc))
-    
-        # Detecta las columnas reales existentes; no modifica SQL.
-        existing_cols = list(contacts_df.columns)
-    
-        def _find_col(candidates):
-            normalized = {str(c).lower().strip(): c for c in existing_cols}
-            for candidate in candidates:
-                cand = candidate.lower().strip()
-                if cand in normalized:
-                    return normalized[cand]
-            for c in existing_cols:
-                nc = str(c).lower()
-                if any(candidate.lower() in nc for candidate in candidates):
-                    return c
-            return None
-    
-        id_col = _find_col(["id"])
-        client_id_col = _find_col(["cliente_id", "client_id", "id_cliente"])
-        client_name_col = _find_col(["cliente", "empresa", "razon_social"])
-        name_col = _find_col(["nombre", "contacto", "nombre_contacto"])
-        area_col = _find_col(["area", "área", "departamento", "sector"])
-        cargo_col = _find_col(["cargo", "puesto"])
-        phone_col = _find_col(["telefono", "teléfono", "celular", "whatsapp"])
-        whatsapp_col = _find_col(["whatsapp", "wa"])
-        email_col = _find_col(["correo", "email", "mail"])
-        birthday_col = _find_col(["cumpleanos", "cumpleaños", "fecha_nacimiento", "nacimiento"])
-        notes_col = _find_col(["observaciones", "notas", "comentarios"])
-        state_col = _find_col(["estado", "activo"])
-        principal_col = _find_col(["principal", "contacto_principal", "es_principal"])
-    
-        # Mapa id -> cliente para mostrar nombres aunque contactos use FK.
-        client_id_to_name = {}
-        if not clients_df.empty and "id" in clients_df.columns and "Cliente" in clients_df.columns:
-            client_id_to_name = dict(zip(clients_df["id"].astype(str), clients_df["Cliente"].astype(str)))
-    
-        if not contacts_df.empty:
-            display = contacts_df.copy()
-            if client_id_col and client_id_col in display.columns:
-                display["Cliente"] = display[client_id_col].astype(str).map(client_id_to_name).fillna("")
-            elif client_name_col:
-                display["Cliente"] = display[client_name_col].fillna("")
-    
-            rename_map = {}
-            for col, label in [
-                (name_col, "Contacto"), (area_col, "Área"), (cargo_col, "Cargo"),
-                (phone_col, "Teléfono"), (whatsapp_col, "WhatsApp"),
-                (email_col, "Correo"), (birthday_col, "Cumpleaños"),
-                (principal_col, "Principal"), (state_col, "Estado"),
-                (notes_col, "Observaciones")
-            ]:
-                if col:
-                    rename_map[col] = label
-            display = display.rename(columns=rename_map)
-    
-            wanted = [c for c in ["Cliente","Contacto","Área","Cargo","Teléfono","WhatsApp",
-                                  "Correo","Cumpleaños","Principal","Estado","Observaciones"]
-                      if c in display.columns]
-            st.dataframe(display[wanted] if wanted else display,
-                         hide_index=True, use_container_width=True)
-    
-        st.markdown("#### ➕ Nuevo contacto")
-        if clients_df.empty:
-            st.info("Primero necesitás tener al menos un cliente.")
-        elif not existing_cols:
-            st.warning("La tabla contactos existe, pero no pude identificar su estructura todavía.")
-        else:
-            selected_client_name = str(selected.get("Cliente", ""))
-            selected_client_row = selected
-            st.info(f"Nuevo contacto para: **{selected_client_name}**")
-    
-            with st.form("new_contact_form_v434", clear_on_submit=True):
-                c1, c2 = st.columns(2)
-                contact_name = c1.text_input("Nombre y apellido *")
-                contact_area = c2.text_input("Área / Departamento",
-                                             placeholder="Compras, Mantenimiento, Producción...")
-    
-                c3, c4 = st.columns(2)
-                contact_cargo = c3.text_input("Cargo / Puesto")
-                contact_phone = c4.text_input("Teléfono / Celular")
-    
-                c5, c6 = st.columns(2)
-                contact_wa = c5.text_input("WhatsApp")
-                contact_email = c6.text_input("Correo")
-    
-                c7, c8 = st.columns(2)
-                contact_birthday = c7.date_input("Cumpleaños", value=None,
-                                                 format="DD/MM/YYYY")
-                contact_principal = c8.checkbox("Contacto principal")
-    
-                contact_notes = st.text_area("Observaciones")
-                save_contact = st.form_submit_button(
-                    "💾 Guardar contacto", type="primary", use_container_width=True
-                )
-    
-            if save_contact:
-                if not (contact_name or "").strip():
-                    st.error("El nombre del contacto es obligatorio.")
-                elif not name_col:
-                    st.error("La tabla contactos no tiene una columna reconocible para el nombre del contacto.")
-                elif not client_id_col and not client_name_col:
-                    st.error("No pude identificar cómo la tabla contactos relaciona el contacto con el cliente.")
-                else:
-                    payload = {}
-                    if client_id_col:
-                        payload[client_id_col] = selected_client_row.get("id")
-                    elif client_name_col:
-                        payload[client_name_col] = selected_client_name
-    
-                    payload[name_col] = contact_name.strip()
-                    if area_col: payload[area_col] = (contact_area or "").strip() or None
-                    if cargo_col: payload[cargo_col] = (contact_cargo or "").strip() or None
-                    if phone_col: payload[phone_col] = (contact_phone or "").strip() or None
-                    if whatsapp_col: payload[whatsapp_col] = (contact_wa or "").strip() or None
-                    elif phone_col and contact_wa and not contact_phone:
-                        payload[phone_col] = contact_wa.strip()
-                    if email_col: payload[email_col] = (contact_email or "").strip() or None
-                    if birthday_col and contact_birthday:
-                        payload[birthday_col] = contact_birthday.isoformat()
-                    if principal_col: payload[principal_col] = bool(contact_principal)
-                    if notes_col: payload[notes_col] = (contact_notes or "").strip() or None
-                    if state_col:
-                        # compatible con campos texto o booleanos comunes
-                        payload[state_col] = "Activo"
-    
-                    try:
-                        supabase.table("contactos").insert(payload).execute()
-                        st.success(f"Contacto **{contact_name.strip()}** guardado para **{selected_client_name}**.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error("No se pudo guardar el contacto con la estructura actual de la tabla.")
-                        st.caption(str(exc))
-    
-        with st.expander("Campos CRM disponibles en la tabla actual"):
-            if existing_cols:
-                st.write(", ".join(map(str, existing_cols)))
-                missing = []
-                for label, col in [
-                    ("Área", area_col), ("Cargo", cargo_col), ("Teléfono", phone_col),
-                    ("WhatsApp", whatsapp_col), ("Correo", email_col),
-                    ("Cumpleaños", birthday_col), ("Contacto principal", principal_col),
-                    ("Observaciones", notes_col)
-                ]:
-                    if not col:
-                        missing.append(label)
-                if missing:
-                    st.info("Estos datos todavía no tienen una columna identificada en Supabase: " +
-                            ", ".join(missing) +
-                            ". La app no modifica SQL automáticamente.")
-                else:
-                    st.success("La tabla actual permite guardar todos los datos principales del contacto.")
-
-# ============================================================
-# PRESUPUESTOS
-# ============================================================
 elif page == "📄 Presupuestos":
     page_header("Presupuestos", "Cotizaciones de productos y servicios vinculadas al CRM")
 
