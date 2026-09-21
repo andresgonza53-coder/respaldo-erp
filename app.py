@@ -51,7 +51,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "4.3.6 - Pulso AG | Ficha de cliente + múltiples contactos"
+APP_VERSION = "4.3.7 - Pulso AG | Ficha de cliente + múltiples contactos"
 
 
 st.markdown("""
@@ -5001,135 +5001,106 @@ elif page == "👥 Clientes":
                     company_contacts=contacts_df[contacts_df[client_name_col].fillna("").astype(str).str.casefold()==str(selected.get("Cliente","")).casefold()].copy()
 
             st.markdown("#### Datos de la empresa")
+            a,b=st.columns([2,1]); e_nombre=a.text_input("Razón social / Nombre *",value=_clean(selected.get("Cliente")),key=f"v437_nom_{selected_id}"); e_ruc=b.text_input("RUC",value=_clean(selected.get("RUC")),key=f"v437_ruc_{selected_id}")
+            c1,c2=st.columns(2); e_ciudad=c1.text_input("Ciudad",value=_clean(selected.get("Ciudad")),key=f"v437_ciu_{selected_id}"); e_direccion=c2.text_input("Dirección",value=_clean(selected.get("Dirección")),key=f"v437_dir_{selected_id}")
+            c3,c4=st.columns(2); e_telefono=c3.text_input("Teléfono / WhatsApp empresa",value=_clean(selected.get("Teléfono")),key=f"v437_tel_{selected_id}"); e_correo=c4.text_input("Correo empresa",value=_clean(selected.get("Correo")),key=f"v437_mail_{selected_id}")
+            current_state=_clean(selected.get("Estado")) or "Activo"; e_estado=st.selectbox("Estado",["Activo","Inactivo"],index=1 if current_state.casefold()=="inactivo" else 0,key=f"v437_est_{selected_id}")
 
-            # V4.3.6: una sola ficha. Empresa + TODOS sus contactos antes de Guardar.
-            # La grilla permite agregar/eliminar filas y editar contactos existentes.
-            contact_rows=[]
-            if not company_contacts.empty:
-                for _, rr in company_contacts.iterrows():
-                    contact_rows.append({
-                        "_id": clean_display_value(rr.get("id")) if "id" in company_contacts.columns else "",
-                        "Nombre y apellido": clean_display_value(rr.get(name_col)) if name_col else "",
-                        "Área / Departamento": clean_display_value(rr.get(area_col)) if area_col else "",
-                        "Cargo / Puesto": clean_display_value(rr.get(cargo_col)) if cargo_col else "",
-                        "Teléfono / Celular": clean_display_value(rr.get(phone_col)) if phone_col else "",
-                        "WhatsApp": clean_display_value(rr.get(whatsapp_col)) if whatsapp_col else "",
-                        "Correo": clean_display_value(rr.get(email_col)) if email_col else "",
-                        "Cumpleaños": clean_display_value(rr.get(birthday_col)) if birthday_col else "",
-                        "Principal": bool(rr.get(principal_col)) if principal_col and pd.notna(rr.get(principal_col)) else False,
-                        "Observaciones": clean_display_value(rr.get(notes_col)) if notes_col else "",
+            st.markdown("#### 👥 Contactos de esta empresa")
+            st.caption("Podés cargar varios contactos en la misma ficha. Agregá o eliminá filas y luego guardá todo con el botón de abajo.")
+
+            required_contact_cols = ["cliente_id","nombre","area","cargo","telefono","whatsapp","correo","cumpleanos","principal","observaciones","estado"]
+            structure_ok = all(c in existing_cols for c in ["cliente_id","nombre"])
+            if not structure_ok:
+                st.warning("La tabla contactos todavía necesita la actualización SQL V4.3.7. Ejecutá primero el archivo SQL que acompaña esta versión.")
+                edited_contacts = pd.DataFrame(columns=["Nombre y apellido","Área / Departamento","Cargo / Puesto","Teléfono / Celular","WhatsApp","Correo","Cumpleaños","Principal","Observaciones"])
+            else:
+                company_contacts = contacts_df[contacts_df["cliente_id"].astype(str)==str(selected_id)].copy() if not contacts_df.empty else pd.DataFrame()
+                rows=[]
+                for _,r in company_contacts.iterrows():
+                    rows.append({
+                        "_id": r.get("id"),
+                        "Nombre y apellido": clean_display_value(r.get("nombre")),
+                        "Área / Departamento": clean_display_value(r.get("area")),
+                        "Cargo / Puesto": clean_display_value(r.get("cargo")),
+                        "Teléfono / Celular": clean_display_value(r.get("telefono")),
+                        "WhatsApp": clean_display_value(r.get("whatsapp")),
+                        "Correo": clean_display_value(r.get("correo")),
+                        "Cumpleaños": clean_display_value(r.get("cumpleanos")),
+                        "Principal": bool(r.get("principal")) if r.get("principal") is not None else False,
+                        "Observaciones": clean_display_value(r.get("observaciones")),
                     })
-            # Siempre deja una fila vacía disponible para que cargar otro contacto sea obvio.
-            contact_rows.append({
-                "_id":"", "Nombre y apellido":"", "Área / Departamento":"", "Cargo / Puesto":"",
-                "Teléfono / Celular":"", "WhatsApp":"", "Correo":"", "Cumpleaños":"",
-                "Principal": False, "Observaciones":""
-            })
-            contacts_editor_df=pd.DataFrame(contact_rows)
+                base_contacts=pd.DataFrame(rows,columns=["_id","Nombre y apellido","Área / Departamento","Cargo / Puesto","Teléfono / Celular","WhatsApp","Correo","Cumpleaños","Principal","Observaciones"])
+                edited_contacts=st.data_editor(
+                    base_contacts,
+                    hide_index=True,
+                    use_container_width=True,
+                    num_rows="dynamic",
+                    column_config={
+                        "_id": None,
+                        "Nombre y apellido": st.column_config.TextColumn("Nombre y apellido",required=True),
+                        "Área / Departamento": st.column_config.TextColumn("Área / Departamento"),
+                        "Cargo / Puesto": st.column_config.TextColumn("Cargo / Puesto"),
+                        "Teléfono / Celular": st.column_config.TextColumn("Teléfono / Celular"),
+                        "WhatsApp": st.column_config.TextColumn("WhatsApp"),
+                        "Correo": st.column_config.TextColumn("Correo"),
+                        "Cumpleaños": st.column_config.TextColumn("Cumpleaños",help="Formato recomendado: AAAA-MM-DD o DD/MM/AAAA"),
+                        "Principal": st.column_config.CheckboxColumn("Principal",default=False),
+                        "Observaciones": st.column_config.TextColumn("Observaciones"),
+                    },
+                    key=f"contacts_editor_v437_{selected_id}",
+                )
+                st.caption("Para agregar otro contacto, usá la fila nueva al final de la tabla. Para quitar uno, seleccioná la fila y eliminála desde el editor.")
 
-            with st.form("integrated_client_form_v436"):
-                a,b=st.columns([2,1]); e_nombre=a.text_input("Razón social / Nombre *",value=_clean(selected.get("Cliente"))); e_ruc=b.text_input("RUC",value=_clean(selected.get("RUC")))
-                c1,c2=st.columns(2); e_ciudad=c1.text_input("Ciudad",value=_clean(selected.get("Ciudad"))); e_direccion=c2.text_input("Dirección",value=_clean(selected.get("Dirección")))
-                c3,c4=st.columns(2); e_telefono=c3.text_input("Teléfono / WhatsApp empresa",value=_clean(selected.get("Teléfono"))); e_correo=c4.text_input("Correo empresa",value=_clean(selected.get("Correo")))
-                current_state=_clean(selected.get("Estado")) or "Activo"; e_estado=st.selectbox("Estado",["Activo","Inactivo"],index=1 if current_state.casefold()=="inactivo" else 0)
-
-                st.markdown("#### 👥 Contactos de esta empresa")
-                st.caption("Cargá todos los contactos dentro de la misma ficha. Podés editar los existentes, agregar nuevas filas o eliminar una fila. Todo se guarda con el botón de abajo.")
-                if not name_col or (not client_id_col and not client_name_col):
-                    st.warning("La tabla contactos existe, pero su estructura no permite vincular contactos con este cliente todavía.")
-                    edited_contacts=contacts_editor_df
-                else:
-                    edited_contacts=st.data_editor(
-                        contacts_editor_df,
-                        hide_index=True,
-                        use_container_width=True,
-                        num_rows="dynamic",
-                        key=f"contacts_grid_v436_{selected_id}",
-                        column_config={
-                            "_id": None,
-                            "Nombre y apellido": st.column_config.TextColumn("Nombre y apellido", required=False, width="medium"),
-                            "Área / Departamento": st.column_config.TextColumn("Área / Departamento", help="Ej.: Compras, Mantenimiento, Producción, Administración"),
-                            "Cargo / Puesto": st.column_config.TextColumn("Cargo / Puesto"),
-                            "Teléfono / Celular": st.column_config.TextColumn("Teléfono / Celular"),
-                            "WhatsApp": st.column_config.TextColumn("WhatsApp"),
-                            "Correo": st.column_config.TextColumn("Correo"),
-                            "Cumpleaños": st.column_config.TextColumn("Cumpleaños", help="Usá DD/MM/AAAA o AAAA-MM-DD"),
-                            "Principal": st.column_config.CheckboxColumn("Principal", default=False),
-                            "Observaciones": st.column_config.TextColumn("Observaciones", width="large"),
-                        }
-                    )
-                    st.caption("➕ Para otro contacto, usá la fila vacía o el botón de agregar fila de la tabla. Podés cargar tantos contactos como necesites.")
-
-                save_all=st.form_submit_button("💾 Guardar ficha del cliente",type="primary",use_container_width=True)
-
+            save_all=st.button("💾 Guardar ficha del cliente",type="primary",use_container_width=True,key=f"save_ficha_v437_{selected_id}")
             if save_all:
                 if not (e_nombre or "").strip():
                     st.error("La Razón social / Nombre es obligatoria.")
+                elif not structure_ok:
+                    st.error("Primero ejecutá el SQL V4.3.7 en Supabase. La empresa no fue modificada.")
                 else:
                     try:
                         supabase.table("clientes").update({"nombre":e_nombre.strip(),"ruc":(e_ruc or "").strip() or None,"ciudad":(e_ciudad or "").strip() or None,"direccion":(e_direccion or "").strip() or None,"telefono":(e_telefono or "").strip() or None,"correo":(e_correo or "").strip() or None,"estado":e_estado}).eq("id",selected_id).execute()
 
-                        if name_col and (client_id_col or client_name_col):
-                            original_ids=set()
-                            if not company_contacts.empty and "id" in company_contacts.columns:
-                                original_ids={str(v) for v in company_contacts["id"].dropna().tolist()}
-                            kept_ids=set()
-
-                            # Solo procesa filas que tengan nombre. Las filas vacías son auxiliares.
-                            rows_to_save=[]
-                            for _, row in edited_contacts.iterrows():
-                                cname=str(row.get("Nombre y apellido","") or "").strip()
-                                if cname and cname.lower() not in {"nan","none"}:
-                                    rows_to_save.append(row)
-
-                            # Si hay un único contacto y ninguno fue marcado principal, lo hace principal.
-                            if len(rows_to_save)==1 and principal_col:
-                                rows_to_save[0]["Principal"]=True
-
-                            for row in rows_to_save:
-                                cid=str(row.get("_id","") or "").strip()
-                                if cid.lower() in {"nan","none"}: cid=""
-                                payload={}
-                                if client_id_col: payload[client_id_col]=selected_id
-                                else: payload[client_name_col]=e_nombre.strip()
-                                payload[name_col]=str(row.get("Nombre y apellido","") or "").strip()
-                                if area_col: payload[area_col]=str(row.get("Área / Departamento","") or "").strip() or None
-                                if cargo_col: payload[cargo_col]=str(row.get("Cargo / Puesto","") or "").strip() or None
-                                if phone_col: payload[phone_col]=str(row.get("Teléfono / Celular","") or "").strip() or None
-                                if whatsapp_col: payload[whatsapp_col]=str(row.get("WhatsApp","") or "").strip() or None
-                                if email_col: payload[email_col]=str(row.get("Correo","") or "").strip() or None
-                                if birthday_col:
-                                    bd=str(row.get("Cumpleaños","") or "").strip()
-                                    if bd.lower() in {"nan","none","nat"}: bd=""
-                                    if bd:
-                                        parsed=None
-                                        for fmt in ("%d/%m/%Y","%Y-%m-%d","%d-%m-%Y"):
-                                            try:
-                                                parsed=datetime.strptime(bd[:10],fmt).date().isoformat(); break
-                                            except Exception: pass
-                                        payload[birthday_col]=parsed or bd
-                                    else: payload[birthday_col]=None
-                                if principal_col: payload[principal_col]=bool(row.get("Principal",False))
-                                if notes_col: payload[notes_col]=str(row.get("Observaciones","") or "").strip() or None
-                                if state_col: payload[state_col]="Activo"
-
-                                if cid and cid in original_ids:
-                                    supabase.table("contactos").update(payload).eq("id",cid).execute()
-                                    kept_ids.add(cid)
-                                else:
-                                    supabase.table("contactos").insert(payload).execute()
-
-                            # Una fila existente eliminada de la grilla se elimina también de contactos.
-                            # Solo se hace si la tabla tiene un id identificable.
-                            for deleted_id in (original_ids-kept_ids):
-                                supabase.table("contactos").delete().eq("id",deleted_id).execute()
-
+                        current_ids=set(str(x) for x in company_contacts.get("id",pd.Series(dtype=object)).dropna().tolist()) if not company_contacts.empty else set()
+                        kept_ids=set()
+                        principal_seen=False
+                        for _,row in edited_contacts.iterrows():
+                            name=str(row.get("Nombre y apellido") or "").strip()
+                            if not name or name.lower()=="nan":
+                                continue
+                            rid=row.get("_id")
+                            rid=None if pd.isna(rid) else str(rid)
+                            principal=bool(row.get("Principal",False))
+                            if principal and principal_seen:
+                                principal=False
+                            if principal: principal_seen=True
+                            birthday=str(row.get("Cumpleaños") or "").strip()
+                            if birthday.lower() in ("nan","nat","none"): birthday=""
+                            payload={
+                                "cliente_id":selected_id,
+                                "nombre":name,
+                                "area":str(row.get("Área / Departamento") or "").strip() or None,
+                                "cargo":str(row.get("Cargo / Puesto") or "").strip() or None,
+                                "telefono":str(row.get("Teléfono / Celular") or "").strip() or None,
+                                "whatsapp":str(row.get("WhatsApp") or "").strip() or None,
+                                "correo":str(row.get("Correo") or "").strip() or None,
+                                "cumpleanos":birthday or None,
+                                "principal":principal,
+                                "observaciones":str(row.get("Observaciones") or "").strip() or None,
+                                "estado":"Activo",
+                            }
+                            if rid and rid in current_ids:
+                                supabase.table("contactos").update(payload).eq("id",rid).execute(); kept_ids.add(rid)
+                            else:
+                                supabase.table("contactos").insert(payload).execute()
+                        for rid in current_ids-kept_ids:
+                            supabase.table("contactos").delete().eq("id",rid).execute()
                         st.success("Ficha del cliente y contactos guardados correctamente.")
                         st.rerun()
                     except Exception as exc:
                         st.error("No se pudo guardar la ficha completa.")
                         st.caption(str(exc))
-
 
 elif page == "📄 Presupuestos":
     page_header("Presupuestos", "Cotizaciones de productos y servicios vinculadas al CRM")
@@ -6840,6 +6811,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Pulso AG · ERP V4.3.6 Pulso AG</div>',
+    '<div class="footer">© 2026 Pulso AG · ERP V4.3.7 Pulso AG</div>',
     unsafe_allow_html=True,
 )
