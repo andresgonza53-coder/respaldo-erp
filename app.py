@@ -51,7 +51,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "4.3.3 - Pulso AG | CRM + contactos"
+APP_VERSION = "4.3.4 - Pulso AG | Ficha de cliente + contactos"
 
 
 st.markdown("""
@@ -4916,8 +4916,8 @@ elif page == "👥 Clientes":
 
     clients_df, _ = fetch_crm_from_db()
 
-    tab_list, tab_new, tab_edit, tab_contacts = st.tabs([
-        "📋 Lista de clientes", "➕ Nuevo cliente", "✏️ Editar cliente", "👤 Contactos CRM"
+    tab_list, tab_new, tab_edit = st.tabs([
+        "📋 Lista de clientes", "➕ Nuevo cliente", "🧾 Ficha del cliente"
     ])
 
     with tab_list:
@@ -4929,13 +4929,13 @@ elif page == "👥 Clientes":
                 search = st.text_input(
                     "Buscar",
                     placeholder="Cliente, RUC, ciudad, teléfono, correo...",
-                    key="clients_search_v432"
+                    key="clients_search_v434"
                 )
             with c2:
                 state_filter = st.selectbox(
                     "Estado",
                     ["Todos", "Activo", "Inactivo"],
-                    key="clients_state_filter_v432"
+                    key="clients_state_filter_v434"
                 )
             with c3:
                 st.metric("Clientes", len(clients_df))
@@ -4966,7 +4966,7 @@ elif page == "👥 Clientes":
         st.markdown("### Crear cliente")
         st.caption("El cliente quedará guardado directamente en la base actual. No requiere cambios en SQL.")
 
-        with st.form("new_client_form_v432", clear_on_submit=True):
+        with st.form("new_client_form_v434", clear_on_submit=True):
             a, b = st.columns([2, 1])
             nombre = a.text_input("Razón social / Nombre *")
             ruc = b.text_input("RUC")
@@ -5036,7 +5036,7 @@ elif page == "👥 Clientes":
             selected_label = st.selectbox(
                 "Seleccionar cliente",
                 options["_label"].tolist(),
-                key="edit_client_selector_v432"
+                key="edit_client_selector_v434"
             )
             selected = options[options["_label"].eq(selected_label)].iloc[0]
 
@@ -5046,7 +5046,7 @@ elif page == "👥 Clientes":
                 s = str(v)
                 return "" if s in ("None", "nan", "<NA>") else s
 
-            with st.form("edit_client_form_v432"):
+            with st.form("edit_client_form_v434"):
                 a, b = st.columns([2, 1])
                 e_nombre = a.text_input(
                     "Razón social / Nombre *",
@@ -5097,10 +5097,12 @@ elif page == "👥 Clientes":
                         st.error("No se pudo actualizar el cliente.")
                         st.caption(str(exc))
 
-    with tab_contacts:
-        st.markdown("### Contactos del CRM")
-        st.caption("Contactos asociados a empresas: compras, mantenimiento, producción, administración y otras áreas.")
 
+
+        st.markdown("---")
+        st.markdown("## 👥 Contactos de esta empresa")
+        st.caption("Los contactos forman parte de la ficha del cliente: compras, mantenimiento, producción, administración y otras áreas.")
+    
         try:
             contacts_raw = supabase.table("contactos").select("*").limit(1000).execute().data or []
             contacts_df = pd.DataFrame(contacts_raw)
@@ -5108,10 +5110,10 @@ elif page == "👥 Clientes":
             contacts_df = pd.DataFrame()
             st.error("No se pudo leer la tabla contactos.")
             st.caption(str(exc))
-
+    
         # Detecta las columnas reales existentes; no modifica SQL.
         existing_cols = list(contacts_df.columns)
-
+    
         def _find_col(candidates):
             normalized = {str(c).lower().strip(): c for c in existing_cols}
             for candidate in candidates:
@@ -5123,7 +5125,7 @@ elif page == "👥 Clientes":
                 if any(candidate.lower() in nc for candidate in candidates):
                     return c
             return None
-
+    
         id_col = _find_col(["id"])
         client_id_col = _find_col(["cliente_id", "client_id", "id_cliente"])
         client_name_col = _find_col(["cliente", "empresa", "razon_social"])
@@ -5137,19 +5139,19 @@ elif page == "👥 Clientes":
         notes_col = _find_col(["observaciones", "notas", "comentarios"])
         state_col = _find_col(["estado", "activo"])
         principal_col = _find_col(["principal", "contacto_principal", "es_principal"])
-
+    
         # Mapa id -> cliente para mostrar nombres aunque contactos use FK.
         client_id_to_name = {}
         if not clients_df.empty and "id" in clients_df.columns and "Cliente" in clients_df.columns:
             client_id_to_name = dict(zip(clients_df["id"].astype(str), clients_df["Cliente"].astype(str)))
-
+    
         if not contacts_df.empty:
             display = contacts_df.copy()
             if client_id_col and client_id_col in display.columns:
                 display["Cliente"] = display[client_id_col].astype(str).map(client_id_to_name).fillna("")
             elif client_name_col:
                 display["Cliente"] = display[client_name_col].fillna("")
-
+    
             rename_map = {}
             for col, label in [
                 (name_col, "Contacto"), (area_col, "Área"), (cargo_col, "Cargo"),
@@ -5161,50 +5163,47 @@ elif page == "👥 Clientes":
                 if col:
                     rename_map[col] = label
             display = display.rename(columns=rename_map)
-
+    
             wanted = [c for c in ["Cliente","Contacto","Área","Cargo","Teléfono","WhatsApp",
                                   "Correo","Cumpleaños","Principal","Estado","Observaciones"]
                       if c in display.columns]
             st.dataframe(display[wanted] if wanted else display,
                          hide_index=True, use_container_width=True)
-
+    
         st.markdown("#### ➕ Nuevo contacto")
         if clients_df.empty:
             st.info("Primero necesitás tener al menos un cliente.")
         elif not existing_cols:
             st.warning("La tabla contactos existe, pero no pude identificar su estructura todavía.")
         else:
-            client_labels = clients_df["Cliente"].fillna("").astype(str).tolist()
-            selected_client_name = st.selectbox("Empresa / Cliente *", client_labels,
-                                                key="contact_client_v433")
-            selected_client_row = clients_df[
-                clients_df["Cliente"].astype(str).eq(selected_client_name)
-            ].iloc[0]
-
-            with st.form("new_contact_form_v433", clear_on_submit=True):
+            selected_client_name = str(selected.get("Cliente", ""))
+            selected_client_row = selected
+            st.info(f"Nuevo contacto para: **{selected_client_name}**")
+    
+            with st.form("new_contact_form_v434", clear_on_submit=True):
                 c1, c2 = st.columns(2)
                 contact_name = c1.text_input("Nombre y apellido *")
                 contact_area = c2.text_input("Área / Departamento",
                                              placeholder="Compras, Mantenimiento, Producción...")
-
+    
                 c3, c4 = st.columns(2)
                 contact_cargo = c3.text_input("Cargo / Puesto")
                 contact_phone = c4.text_input("Teléfono / Celular")
-
+    
                 c5, c6 = st.columns(2)
                 contact_wa = c5.text_input("WhatsApp")
                 contact_email = c6.text_input("Correo")
-
+    
                 c7, c8 = st.columns(2)
                 contact_birthday = c7.date_input("Cumpleaños", value=None,
                                                  format="DD/MM/YYYY")
                 contact_principal = c8.checkbox("Contacto principal")
-
+    
                 contact_notes = st.text_area("Observaciones")
                 save_contact = st.form_submit_button(
                     "💾 Guardar contacto", type="primary", use_container_width=True
                 )
-
+    
             if save_contact:
                 if not (contact_name or "").strip():
                     st.error("El nombre del contacto es obligatorio.")
@@ -5218,7 +5217,7 @@ elif page == "👥 Clientes":
                         payload[client_id_col] = selected_client_row.get("id")
                     elif client_name_col:
                         payload[client_name_col] = selected_client_name
-
+    
                     payload[name_col] = contact_name.strip()
                     if area_col: payload[area_col] = (contact_area or "").strip() or None
                     if cargo_col: payload[cargo_col] = (contact_cargo or "").strip() or None
@@ -5234,7 +5233,7 @@ elif page == "👥 Clientes":
                     if state_col:
                         # compatible con campos texto o booleanos comunes
                         payload[state_col] = "Activo"
-
+    
                     try:
                         supabase.table("contactos").insert(payload).execute()
                         st.success(f"Contacto **{contact_name.strip()}** guardado para **{selected_client_name}**.")
@@ -5242,7 +5241,7 @@ elif page == "👥 Clientes":
                     except Exception as exc:
                         st.error("No se pudo guardar el contacto con la estructura actual de la tabla.")
                         st.caption(str(exc))
-
+    
         with st.expander("Campos CRM disponibles en la tabla actual"):
             if existing_cols:
                 st.write(", ".join(map(str, existing_cols)))
@@ -5261,7 +5260,6 @@ elif page == "👥 Clientes":
                             ". La app no modifica SQL automáticamente.")
                 else:
                     st.success("La tabla actual permite guardar todos los datos principales del contacto.")
-
 
 # ============================================================
 # PRESUPUESTOS
@@ -6975,6 +6973,6 @@ elif page == "⚙️ Configuración":
 
 
 st.markdown(
-    '<div class="footer">© 2026 Pulso AG · ERP V4.3.3 Pulso AG</div>',
+    '<div class="footer">© 2026 Pulso AG · ERP V4.3.4 Pulso AG</div>',
     unsafe_allow_html=True,
 )
